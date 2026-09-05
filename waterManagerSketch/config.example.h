@@ -1,15 +1,13 @@
 #pragma once
 
-// ============================================================
-// Example configuration
-// Copy this file to config.h and fill in your values.
-// ============================================================
-
-#define DUCKDNS_DOMAIN "your-domain"
-#define DUCKDNS_TOKEN  "your-duckdns-token"
+#define DUCKDNS_DOMAIN "watermanager"
+#define DUCKDNS_TOKEN  "YOUR_REAL_DUCKDNS_TOKEN"
 
 #define WEB_USERNAME   "admin"
-#define WEB_PASSWORD   "change-this-password"
+#define WEB_PASSWORD   "YOUR_STRONG_PASSWORD"
 
 #define AP_SSID        "ESP32-WaterMonitor"
-#define AP_PASSWORD    "change-this-password"
+#define AP_PASSWORD    "YOUR_STRONG_AP_PASSWORD"
+
+#define TELEGRAM_BOT_TOKEN "YOUR_BOT_TOKEN"
+#define TELEGRAM_CHAT_ID   "YOUR_CHAT_ID"
