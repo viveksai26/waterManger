@@ -1,0 +1,13 @@
+# Private ESP32 configuration
+config.h
+
+# Arduino build/output files
+build/
+*.bin
+*.elf
+*.map
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/

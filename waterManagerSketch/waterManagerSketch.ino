@@ -2,9 +2,14 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+#include "config.h"
 
 // ============================================================
-// ESP32 Water Monitor - V2
+// ESP32 Water Monitor - V3
+//
 // Features:
 //   - Persistent Wi-Fi credentials
 //   - Wi-Fi scanning
@@ -14,20 +19,27 @@
 //   - Browser OTA firmware update
 //   - System logs
 //   - Restart
+//   - IPv6 address detection
+//   - Automatic DuckDNS IPv6 update
+//
+// Secrets/configuration are stored in config.h
+// config.h MUST NOT be committed to Git.
 // ============================================================
 
 WebServer server(80);
 Preferences preferences;
 
 // ============================================================
-// Configuration
+// DuckDNS
 // ============================================================
 
-const char* AP_SSID = "ESP32-WaterMonitor";
-const char* AP_PASSWORD = "01234567890";
+const unsigned long DUCKDNS_UPDATE_INTERVAL =
+  10UL * 60UL * 1000UL;   // 10 minutes
 
-const char* WEB_USERNAME = "admin";
-const char* WEB_PASSWORD = "admin1234";
+unsigned long lastDuckDNSUpdate = 0;
+
+String lastDuckDNSIPv6 = "";
+String duckDNSStatus = "Not updated yet";
 
 // ============================================================
 // Wi-Fi credentials
@@ -50,7 +62,8 @@ int logCount = 0;
 void addLog(String message) {
 
   String entry =
-    "[" + String(millis() / 1000) + "s] " + message;
+    "[" + String(millis() / 1000) + "s] " +
+    message;
 
   Serial.println(entry);
 
@@ -75,7 +88,10 @@ void addLog(String message) {
 
 bool authenticate() {
 
-  if (!server.authenticate(WEB_USERNAME, WEB_PASSWORD)) {
+  if (!server.authenticate(
+        WEB_USERNAME,
+        WEB_PASSWORD
+      )) {
 
     server.requestAuthentication();
 
@@ -93,18 +109,25 @@ void loadWiFiCredentials() {
 
   preferences.begin("wifi", true);
 
-  wifiSSID = preferences.getString("ssid", "");
-  wifiPassword = preferences.getString("password", "");
+  wifiSSID =
+    preferences.getString("ssid", "");
+
+  wifiPassword =
+    preferences.getString("password", "");
 
   preferences.end();
 
   if (wifiSSID.length() > 0) {
 
-    addLog("Saved Wi-Fi credentials loaded");
+    addLog(
+      "Saved Wi-Fi credentials loaded"
+    );
 
   } else {
 
-    addLog("No saved Wi-Fi credentials");
+    addLog(
+      "No saved Wi-Fi credentials"
+    );
   }
 }
 
@@ -112,19 +135,31 @@ void loadWiFiCredentials() {
 // Save Wi-Fi credentials
 // ============================================================
 
-void saveWiFiCredentials(String ssid, String password) {
+void saveWiFiCredentials(
+  String ssid,
+  String password
+) {
 
   preferences.begin("wifi", false);
 
-  preferences.putString("ssid", ssid);
-  preferences.putString("password", password);
+  preferences.putString(
+    "ssid",
+    ssid
+  );
+
+  preferences.putString(
+    "password",
+    password
+  );
 
   preferences.end();
 
   wifiSSID = ssid;
   wifiPassword = password;
 
-  addLog("Wi-Fi credentials saved");
+  addLog(
+    "Wi-Fi credentials saved"
+  );
 }
 
 // ============================================================
@@ -137,13 +172,218 @@ void startSetupMode() {
 
   WiFi.mode(WIFI_AP);
 
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.softAP(
+    AP_SSID,
+    AP_PASSWORD
+  );
 
-  IPAddress ip = WiFi.softAPIP();
+  IPAddress ip =
+    WiFi.softAPIP();
 
-  addLog("Setup mode started");
-  addLog("AP SSID: " + String(AP_SSID));
-  addLog("AP IP: " + ip.toString());
+  addLog(
+    "Setup mode started"
+  );
+
+  addLog(
+    "AP SSID: " +
+    String(AP_SSID)
+  );
+
+  addLog(
+    "AP IP: " +
+    ip.toString()
+  );
+}
+
+// ============================================================
+// Get global IPv6
+// ============================================================
+
+String getIPv6Address() {
+
+  if (setupMode) {
+    return "Not available in setup mode";
+  }
+
+  if (!WiFi.STA.hasGlobalIPv6()) {
+    return "No global IPv6";
+  }
+
+  IPAddress ipv6 =
+    WiFi.STA.globalIPv6();
+
+  return ipv6.toString();
+}
+
+// ============================================================
+// Update DuckDNS
+// ============================================================
+
+bool updateDuckDNS() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    duckDNSStatus =
+      "Wi-Fi not connected";
+
+    addLog(
+      "DuckDNS skipped: Wi-Fi not connected"
+    );
+
+    return false;
+  }
+
+  if (!WiFi.STA.hasGlobalIPv6()) {
+
+    duckDNSStatus =
+      "No global IPv6";
+
+    addLog(
+      "DuckDNS skipped: no global IPv6"
+    );
+
+    return false;
+  }
+
+  String ipv6 =
+    WiFi.STA.globalIPv6().toString();
+
+  // ----------------------------------------------------------
+  // Don't update if address hasn't changed
+  // ----------------------------------------------------------
+
+  if (
+    ipv6 == lastDuckDNSIPv6 &&
+    lastDuckDNSUpdate != 0
+  ) {
+
+    duckDNSStatus =
+      "IPv6 unchanged";
+
+    addLog(
+      "DuckDNS skipped: IPv6 unchanged"
+    );
+
+    return true;
+  }
+
+  // ----------------------------------------------------------
+  // Build DuckDNS request
+  // ----------------------------------------------------------
+
+  String url =
+    "https://www.duckdns.org/update"
+    "?domains=" +
+    String(DUCKDNS_DOMAIN) +
+    "&token=" +
+    String(DUCKDNS_TOKEN) +
+    "&ipv6=" +
+    ipv6 +
+    "&verbose=true";
+
+  addLog(
+    "Updating DuckDNS..."
+  );
+
+  addLog(
+    "IPv6: " + ipv6
+  );
+
+  // ----------------------------------------------------------
+  // HTTPS
+  // ----------------------------------------------------------
+
+  WiFiClientSecure client;
+
+  // HTTPS without storing a CA certificate.
+  // Suitable for this initial DDNS implementation.
+  client.setInsecure();
+
+  HTTPClient http;
+
+  http.setTimeout(15000);
+
+  if (!http.begin(client, url)) {
+
+    duckDNSStatus =
+      "HTTPS connection failed";
+
+    addLog(
+      "DuckDNS HTTPS connection failed"
+    );
+
+    return false;
+  }
+
+  // ----------------------------------------------------------
+  // Send request
+  // ----------------------------------------------------------
+
+  int httpCode =
+    http.GET();
+
+  if (httpCode <= 0) {
+
+    duckDNSStatus =
+      "HTTP error: " +
+      String(httpCode);
+
+    addLog(
+      "DuckDNS HTTP error: " +
+      String(httpCode)
+    );
+
+    http.end();
+
+    return false;
+  }
+
+  // ----------------------------------------------------------
+  // Read response
+  // ----------------------------------------------------------
+
+  String response =
+    http.getString();
+
+  response.trim();
+
+  http.end();
+
+  addLog(
+    "DuckDNS response: " +
+    response
+  );
+
+  // ----------------------------------------------------------
+  // Check result
+  // ----------------------------------------------------------
+
+  if (response.startsWith("OK")) {
+
+    lastDuckDNSIPv6 = ipv6;
+
+    lastDuckDNSUpdate =
+      millis();
+
+    duckDNSStatus =
+      "Updated successfully";
+
+    addLog(
+      "DuckDNS update successful"
+    );
+
+    return true;
+  }
+
+  duckDNSStatus =
+    "Update failed: " +
+    response;
+
+  addLog(
+    "DuckDNS update failed"
+  );
+
+  return false;
 }
 
 // ============================================================
@@ -154,7 +394,9 @@ bool connectToWiFi() {
 
   if (wifiSSID.length() == 0) {
 
-    addLog("No Wi-Fi configured");
+    addLog(
+      "No Wi-Fi configured"
+    );
 
     return false;
   }
@@ -163,12 +405,18 @@ bool connectToWiFi() {
 
   WiFi.mode(WIFI_STA);
 
+  // Enable IPv6
+  WiFi.STA.enableIPv6(true);
+
   WiFi.begin(
     wifiSSID.c_str(),
     wifiPassword.c_str()
   );
 
-  addLog("Connecting to Wi-Fi: " + wifiSSID);
+  addLog(
+    "Connecting to Wi-Fi: " +
+    wifiSSID
+  );
 
   int attempts = 0;
 
@@ -186,27 +434,67 @@ bool connectToWiFi() {
 
   Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED) {
-
-    addLog("Wi-Fi connected");
+  if (WiFi.status() != WL_CONNECTED) {
 
     addLog(
-      "IP address: " +
-      WiFi.localIP().toString()
+      "Wi-Fi connection failed"
     );
 
-    addLog(
-      "Signal: " +
-      String(WiFi.RSSI()) +
-      " dBm"
-    );
-
-    return true;
+    return false;
   }
 
-  addLog("Wi-Fi connection failed");
+  addLog(
+    "Wi-Fi connected"
+  );
 
-  return false;
+  addLog(
+    "IP address: " +
+    WiFi.localIP().toString()
+  );
+
+  // ----------------------------------------------------------
+  // Wait for global IPv6
+  // ----------------------------------------------------------
+
+  int ipv6Attempts = 0;
+
+  while (
+    !WiFi.STA.hasGlobalIPv6() &&
+    ipv6Attempts < 20
+  ) {
+
+    delay(500);
+
+    ipv6Attempts++;
+  }
+
+  if (WiFi.STA.hasGlobalIPv6()) {
+
+    addLog(
+      "Global IPv6: " +
+      WiFi.STA.globalIPv6().toString()
+    );
+
+  } else {
+
+    addLog(
+      "No global IPv6 address"
+    );
+  }
+
+  addLog(
+    "Signal: " +
+    String(WiFi.RSSI()) +
+    " dBm"
+  );
+
+  // ----------------------------------------------------------
+  // Initial DuckDNS update
+  // ----------------------------------------------------------
+
+  updateDuckDNS();
+
+  return true;
 }
 
 // ============================================================
@@ -215,17 +503,21 @@ bool connectToWiFi() {
 
 String getUptime() {
 
-  unsigned long seconds = millis() / 1000;
+  unsigned long seconds =
+    millis() / 1000;
 
-  unsigned long days = seconds / 86400;
+  unsigned long days =
+    seconds / 86400;
 
   seconds %= 86400;
 
-  unsigned long hours = seconds / 3600;
+  unsigned long hours =
+    seconds / 3600;
 
   seconds %= 3600;
 
-  unsigned long minutes = seconds / 60;
+  unsigned long minutes =
+    seconds / 60;
 
   seconds %= 60;
 
@@ -242,10 +534,9 @@ String getIPAddress() {
 
     return WiFi.softAPIP().toString();
 
-  } else {
-
-    return WiFi.localIP().toString();
   }
+
+  return WiFi.localIP().toString();
 }
 
 String getSSID() {
@@ -254,10 +545,9 @@ String getSSID() {
 
     return String(AP_SSID);
 
-  } else {
-
-    return WiFi.SSID();
   }
+
+  return WiFi.SSID();
 }
 
 String getRSSI() {
@@ -266,10 +556,10 @@ String getRSSI() {
 
     return "Setup mode";
 
-  } else {
-
-    return String(WiFi.RSSI()) + " dBm";
   }
+
+  return String(WiFi.RSSI()) +
+         " dBm";
 }
 
 // ============================================================
@@ -369,11 +659,6 @@ button {
   color: white;
 }
 
-.secondary {
-  background: #555;
-  color: white;
-}
-
 a {
   text-decoration: none;
 }
@@ -392,7 +677,6 @@ a {
 
 <div class="status %STATUS_CLASS%">
 %STATUS%
-
 </div>
 
 </div>
@@ -406,8 +690,11 @@ a {
 <b>SSID</b>
 <span>%SSID%</span>
 
-<b>IP Address</b>
+<b>IPv4 Address</b>
 <span>%IP%</span>
+
+<b>IPv6 Address</b>
+<span>%IPV6%</span>
 
 <b>Signal</b>
 <span>%RSSI%</span>
@@ -421,6 +708,22 @@ a {
 Wi-Fi Settings
 </button>
 </a>
+
+</div>
+
+<div class="card">
+
+<h2>Internet / DDNS</h2>
+
+<div class="info">
+
+<b>Hostname</b>
+<span>watermanager.duckdns.org</span>
+
+<b>DuckDNS Status</b>
+<span>%DUCKDNS_STATUS%</span>
+
+</div>
 
 </div>
 
@@ -440,7 +743,7 @@ Wi-Fi Settings
 <span>%HEAP% bytes</span>
 
 <b>Firmware</b>
-<span>V2.0</span>
+<span>V3.0</span>
 
 </div>
 
@@ -502,7 +805,9 @@ function restartESP() {
     status = "🟠 SETUP MODE";
     statusClass = "setup";
 
-  } else if (WiFi.status() == WL_CONNECTED) {
+  } else if (
+    WiFi.status() == WL_CONNECTED
+  ) {
 
     status = "🟢 ESP32 ONLINE";
     statusClass = "online";
@@ -513,14 +818,45 @@ function restartESP() {
     statusClass = "setup";
   }
 
-  html.replace("%STATUS%", status);
-  html.replace("%STATUS_CLASS%", statusClass);
+  html.replace(
+    "%STATUS%",
+    status
+  );
 
-  html.replace("%SSID%", getSSID());
-  html.replace("%IP%", getIPAddress());
-  html.replace("%RSSI%", getRSSI());
+  html.replace(
+    "%STATUS_CLASS%",
+    statusClass
+  );
 
-  html.replace("%UPTIME%", getUptime());
+  html.replace(
+    "%SSID%",
+    getSSID()
+  );
+
+  html.replace(
+    "%IP%",
+    getIPAddress()
+  );
+
+  html.replace(
+    "%IPV6%",
+    getIPv6Address()
+  );
+
+  html.replace(
+    "%RSSI%",
+    getRSSI()
+  );
+
+  html.replace(
+    "%DUCKDNS_STATUS%",
+    duckDNSStatus
+  );
+
+  html.replace(
+    "%UPTIME%",
+    getUptime()
+  );
 
   html.replace(
     "%HEAP%",
@@ -529,7 +865,11 @@ function restartESP() {
 
   String logText;
 
-  for (int i = 0; i < logCount; i++) {
+  for (
+    int i = 0;
+    i < logCount;
+    i++
+  ) {
 
     logText += logs[i];
 
@@ -538,7 +878,10 @@ function restartESP() {
     }
   }
 
-  html.replace("%LOGS%", logText);
+  html.replace(
+    "%LOGS%",
+    logText
+  );
 
   server.send(
     200,
@@ -557,7 +900,8 @@ void handleWiFiPage() {
     return;
   }
 
-  int networkCount = WiFi.scanNetworks();
+  int networkCount =
+    WiFi.scanNetworks();
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -664,22 +1008,39 @@ Back to Dashboard
 
   String networks;
 
-  for (int i = 0; i < networkCount; i++) {
+  for (
+    int i = 0;
+    i < networkCount;
+    i++
+  ) {
 
-    String ssid = WiFi.SSID(i);
+    String ssid =
+      WiFi.SSID(i);
 
     if (ssid.length() == 0) {
       continue;
     }
 
-    networks += "<option value=\"";
+    networks +=
+      "<option value=\"";
+
     networks += ssid;
-    networks += "\">";
+
+    networks +=
+      "\">";
+
     networks += ssid;
+
     networks += " (";
-    networks += String(WiFi.RSSI(i));
-    networks += " dBm)";
-    networks += "</option>";
+
+    networks +=
+      String(WiFi.RSSI(i));
+
+    networks +=
+      " dBm)";
+
+    networks +=
+      "</option>";
   }
 
   html.replace(
@@ -907,7 +1268,10 @@ void handleUpdateUpload() {
   HTTPUpload& upload =
     server.upload();
 
-  if (upload.status == UPLOAD_FILE_START) {
+  if (
+    upload.status ==
+    UPLOAD_FILE_START
+  ) {
 
     if (!authenticate()) {
       return;
@@ -918,16 +1282,23 @@ void handleUpdateUpload() {
       upload.filename
     );
 
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+    if (
+      !Update.begin(
+        UPDATE_SIZE_UNKNOWN
+      )
+    ) {
 
       Update.printError(Serial);
 
-      addLog("OTA begin failed");
+      addLog(
+        "OTA begin failed"
+      );
     }
   }
 
   else if (
-    upload.status == UPLOAD_FILE_WRITE
+    upload.status ==
+    UPLOAD_FILE_WRITE
   ) {
 
     if (
@@ -942,10 +1313,13 @@ void handleUpdateUpload() {
   }
 
   else if (
-    upload.status == UPLOAD_FILE_END
+    upload.status ==
+    UPLOAD_FILE_END
   ) {
 
-    if (Update.end(true)) {
+    if (
+      Update.end(true)
+    ) {
 
       addLog(
         "OTA update successful"
@@ -1005,25 +1379,48 @@ void setup() {
 
   delay(1000);
 
-  addLog("================================");
-  addLog("ESP32 Water Monitor V2");
-  addLog("Booting...");
-  addLog("================================");
+  addLog(
+    "================================"
+  );
 
+  addLog(
+    "ESP32 Water Monitor V3"
+  );
+
+  addLog(
+    "Booting..."
+  );
+
+  addLog(
+    "================================"
+  );
+
+  // ----------------------------------------------------------
   // Load saved Wi-Fi
+  // ----------------------------------------------------------
+
   loadWiFiCredentials();
 
-  // Try Wi-Fi
+  // ----------------------------------------------------------
+  // Connect to Wi-Fi
+  // ----------------------------------------------------------
+
   bool connected =
     connectToWiFi();
 
-  // If failed, start setup AP
+  // ----------------------------------------------------------
+  // Start setup AP if connection failed
+  // ----------------------------------------------------------
+
   if (!connected) {
 
     startSetupMode();
   }
 
+  // ----------------------------------------------------------
   // Web routes
+  // ----------------------------------------------------------
+
   server.on(
     "/",
     HTTP_GET,
@@ -1063,7 +1460,13 @@ void setup() {
 
   server.begin();
 
-  addLog("Web server started");
+  addLog(
+    "Web server started"
+  );
+
+  // ----------------------------------------------------------
+  // Startup information
+  // ----------------------------------------------------------
 
   if (setupMode) {
 
@@ -1083,6 +1486,15 @@ void setup() {
       "Dashboard: http://" +
       WiFi.localIP().toString()
     );
+
+    addLog(
+      "IPv6: " +
+      getIPv6Address()
+    );
+
+    addLog(
+      "DuckDNS: watermanager.duckdns.org"
+    );
   }
 }
 
@@ -1093,6 +1505,28 @@ void setup() {
 void loop() {
 
   server.handleClient();
+
+  // ----------------------------------------------------------
+  // Periodic DuckDNS update
+  // ----------------------------------------------------------
+
+  if (
+    WiFi.status() == WL_CONNECTED &&
+    !setupMode
+  ) {
+
+    unsigned long now =
+      millis();
+
+    if (
+      lastDuckDNSUpdate == 0 ||
+      now - lastDuckDNSUpdate >=
+        DUCKDNS_UPDATE_INTERVAL
+    ) {
+
+      updateDuckDNS();
+    }
+  }
 
   delay(2);
 }
