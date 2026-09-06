@@ -4,6 +4,7 @@
 #include <Update.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <ESPmDNS.h>
 
 #include "config.h"
 
@@ -11,42 +12,45 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.0"
+#define FIRMWARE_VERSION "4.1"
+
+// ============================================================
+// mDNS
+// ============================================================
+
+#define MDNS_HOSTNAME "watermanager"
 
 // ============================================================
 // TIMING
 // ============================================================
 
-const unsigned long WIFI_TIMEOUT = 15000UL;
+const unsigned long WIFI_TIMEOUT =
+    15000UL;
 
-const unsigned long DUCKDNS_UPDATE_INTERVAL = 10UL * 60UL * 1000UL;
+const unsigned long DUCKDNS_UPDATE_INTERVAL =
+    10UL * 60UL * 1000UL;
 
-const unsigned long SENSOR_INTERVAL = 1000UL;
+const unsigned long SENSOR_INTERVAL =
+    1000UL;
 
-const unsigned long WATER_DEBOUNCE_TIME = 3000UL;
+const unsigned long WATER_DEBOUNCE_TIME =
+    3000UL;
 
-const unsigned long LEVEL_DEBOUNCE_TIME = 3000UL;
+const unsigned long LEVEL_DEBOUNCE_TIME =
+    3000UL;
 
-const unsigned long TELEGRAM_COOLDOWN = 30000UL;
+const unsigned long TELEGRAM_COOLDOWN =
+    30000UL;
 
 // ============================================================
-// WATER SENSOR PINS
+// WATER PRESENCE SENSOR
 // ============================================================
-
-// Water presence sensor
-//
-// DRIVE pin briefly supplies voltage to the sensing circuit.
-// SENSE pin reads the result.
-//
-// IMPORTANT:
-// GPIO34 is input-only and has NO internal pull-up/pull-down.
-// Your external sensor circuit must provide the required biasing.
 
 #define WATER_DRIVE_PIN 25
 #define WATER_SENSE_PIN 34
 
 // ============================================================
-// WATER LEVEL PINS
+// WATER LEVEL SENSORS
 // ============================================================
 
 #define LEVEL1_PIN 32
@@ -69,6 +73,8 @@ Preferences preferences;
 
 bool wifiConnected = false;
 
+bool mdnsRunning = false;
+
 bool waterPresence = false;
 bool lastRawWaterPresence = false;
 
@@ -89,7 +95,6 @@ String telegramStatus = "Not tested";
 
 unsigned long lastDuckDNSUpdate = 0;
 unsigned long lastSensorRead = 0;
-
 unsigned long lastTelegramSent = 0;
 
 bool otaRunning = false;
@@ -108,10 +113,15 @@ int logCount = 0;
 void addLog(String message) {
 
   String entry =
-      "[" + String(millis() / 1000) + "s] " + message;
+      "[" +
+      String(millis() / 1000) +
+      "s] " +
+      message;
 
   if (logCount < MAX_LOGS) {
+
     logs[logCount++] = entry;
+
   } else {
 
     for (int i = 0; i < MAX_LOGS - 1; i++) {
@@ -132,7 +142,8 @@ String urlEncode(const String &text) {
 
   String encoded = "";
 
-  const char *hex = "0123456789ABCDEF";
+  const char *hex =
+      "0123456789ABCDEF";
 
   for (size_t i = 0; i < text.length(); i++) {
 
@@ -147,7 +158,9 @@ String urlEncode(const String &text) {
         c == '.' ||
         c == '~'
     ) {
+
       encoded += c;
+
     } else {
 
       encoded += '%';
@@ -165,7 +178,12 @@ String urlEncode(const String &text) {
 
 bool authenticate() {
 
-  if (!server.authenticate(WEB_USERNAME, WEB_PASSWORD)) {
+  if (
+      !server.authenticate(
+          WEB_USERNAME,
+          WEB_PASSWORD
+      )
+  ) {
 
     server.requestAuthentication();
 
@@ -176,44 +194,101 @@ bool authenticate() {
 }
 
 // ============================================================
+// mDNS
+// ============================================================
+
+void stopMDNS() {
+
+  if (mdnsRunning) {
+
+    MDNS.end();
+
+    mdnsRunning = false;
+
+    addLog("mDNS stopped");
+  }
+}
+
+void startMDNS() {
+
+  stopMDNS();
+
+  if (
+      MDNS.begin(MDNS_HOSTNAME)
+  ) {
+
+    mdnsRunning = true;
+
+    MDNS.addService(
+        "http",
+        "tcp",
+        80
+    );
+
+    addLog(
+        "mDNS started: http://" +
+        String(MDNS_HOSTNAME) +
+        ".local"
+    );
+
+  } else {
+
+    addLog("mDNS failed to start");
+  }
+}
+
+// ============================================================
 // IPV6
 // ============================================================
 
 String getIPv6Address() {
 
-  if (!WiFi.STA.hasGlobalIPv6()) {
+  if (
+      !WiFi.STA.hasGlobalIPv6()
+  ) {
     return "";
   }
 
-  IPAddress ipv6 = WiFi.STA.globalIPv6();
+  IPAddress ipv6 =
+      WiFi.STA.globalIPv6();
 
   return ipv6.toString();
 }
 
 // ============================================================
-// WIFI
+// WIFI CONNECTION
 // ============================================================
 
 bool connectToWiFi() {
 
   String ssid =
-      preferences.getString("ssid", "");
+      preferences.getString(
+          "ssid",
+          ""
+      );
 
   String password =
-      preferences.getString("password", "");
+      preferences.getString(
+          "password",
+          ""
+      );
 
   if (ssid.length() == 0) {
 
-    addLog("No saved Wi-Fi credentials");
+    addLog(
+        "No saved Wi-Fi credentials"
+    );
 
     return false;
   }
 
-  addLog("Connecting to Wi-Fi: " + ssid);
+  addLog(
+      "Connecting to Wi-Fi: " +
+      ssid
+  );
 
   WiFi.mode(WIFI_STA);
 
-  // Enable IPv6 SLAAC
   WiFi.STA.enableIPv6(true);
 
   WiFi.begin(
@@ -221,7 +296,8 @@ bool connectToWiFi() {
       password.c_str()
   );
 
-  unsigned long start = millis();
+  unsigned long start =
+      millis();
 
   while (
       WiFi.status() != WL_CONNECTED &&
@@ -235,11 +311,15 @@ bool connectToWiFi() {
 
   Serial.println();
 
-  if (WiFi.status() != WL_CONNECTED) {
-
-    addLog("Wi-Fi connection failed");
+  if (
+      WiFi.status() != WL_CONNECTED
+  ) {
 
     wifiConnected = false;
+
+    addLog(
+        "Wi-Fi connection failed"
+    );
 
     return false;
   }
@@ -250,11 +330,18 @@ bool connectToWiFi() {
       WiFi.localIP().toString();
 
   addLog(
-      "Wi-Fi connected. IPv4: " +
+      "Wi-Fi connected"
+  );
+
+  addLog(
+      "IPv4: " +
       currentIPv4
   );
 
-  // Wait briefly for IPv6 address
+  // ----------------------------------------------------------
+  // WAIT FOR GLOBAL IPV6
+  // ----------------------------------------------------------
+
   start = millis();
 
   while (
@@ -265,9 +352,12 @@ bool connectToWiFi() {
     delay(250);
   }
 
-  currentIPv6 = getIPv6Address();
+  currentIPv6 =
+      getIPv6Address();
 
-  if (currentIPv6.length() > 0) {
+  if (
+      currentIPv6.length() > 0
+  ) {
 
     addLog(
         "Global IPv6: " +
@@ -276,8 +366,16 @@ bool connectToWiFi() {
 
   } else {
 
-    addLog("Global IPv6 not available");
+    addLog(
+        "Global IPv6 not available"
+    );
   }
+
+  // ----------------------------------------------------------
+  // mDNS
+  // ----------------------------------------------------------
+
+  startMDNS();
 
   return true;
 }
@@ -287,6 +385,8 @@ bool connectToWiFi() {
 // ============================================================
 
 void startSetupAP() {
+
+  stopMDNS();
 
   WiFi.mode(WIFI_AP);
 
@@ -307,6 +407,23 @@ void startSetupAP() {
       "AP IP: " +
       apIP.toString()
   );
+
+  // ----------------------------------------------------------
+  // mDNS on AP
+  // ----------------------------------------------------------
+
+  startMDNS();
+
+  addLog(
+      "AP dashboard: http://" +
+      String(apIP.toString())
+  );
+
+  addLog(
+      "mDNS dashboard: http://" +
+      String(MDNS_HOSTNAME) +
+      ".local"
+  );
 }
 
 // ============================================================
@@ -326,7 +443,9 @@ bool updateDuckDNS() {
   String ipv6 =
       getIPv6Address();
 
-  if (ipv6.length() == 0) {
+  if (
+      ipv6.length() == 0
+  ) {
 
     duckDNSStatus =
         "No global IPv6";
@@ -338,7 +457,7 @@ bool updateDuckDNS() {
     return false;
   }
 
-  // No need to update if address has not changed
+  // No need to update if IPv6 hasn't changed
   if (
       ipv6 == lastDuckDNSIPv6 &&
       lastDuckDNSUpdate != 0
@@ -357,9 +476,6 @@ bool updateDuckDNS() {
 
   WiFiClientSecure client;
 
-  // DuckDNS HTTPS certificate validation would require
-  // maintaining a CA certificate. For this local device,
-  // use HTTPS transport with certificate verification disabled.
   client.setInsecure();
 
   HTTPClient http;
@@ -374,7 +490,12 @@ bool updateDuckDNS() {
       ipv6 +
       "&verbose=true";
 
-  if (!http.begin(client, url)) {
+  if (
+      !http.begin(
+          client,
+          url
+      )
+  ) {
 
     duckDNSStatus =
         "HTTPS connection failed";
@@ -401,7 +522,8 @@ bool updateDuckDNS() {
 
     lastDuckDNSIPv6 = ipv6;
 
-    lastDuckDNSUpdate = millis();
+    lastDuckDNSUpdate =
+        millis();
 
     duckDNSStatus =
         "Updated successfully";
@@ -464,8 +586,6 @@ bool sendTelegram(
 
   WiFiClientSecure client;
 
-  // HTTPS transport.
-  // Telegram's API itself requires HTTPS.
   client.setInsecure();
 
   HTTPClient http;
@@ -475,11 +595,18 @@ bool sendTelegram(
       String(TELEGRAM_BOT_TOKEN) +
       "/sendMessage"
       "?chat_id=" +
-      urlEncode(String(TELEGRAM_CHAT_ID)) +
+      urlEncode(
+          String(TELEGRAM_CHAT_ID)
+      ) +
       "&text=" +
       urlEncode(message);
 
-  if (!http.begin(client, url)) {
+  if (
+      !http.begin(
+          client,
+          url
+      )
+  ) {
 
     telegramStatus =
         "HTTPS connection failed";
@@ -504,7 +631,8 @@ bool sendTelegram(
       response.indexOf("\"ok\":true") >= 0
   ) {
 
-    lastTelegramSent = millis();
+    lastTelegramSent =
+        millis();
 
     telegramStatus =
         "Last message sent successfully";
@@ -529,12 +657,12 @@ bool sendTelegram(
 }
 
 // ============================================================
-// WATER PRESENCE SENSOR
+// WATER PRESENCE
 // ============================================================
 
 bool readWaterPresenceRaw() {
 
-  // Keep electrodes normally unpowered
+  // Keep sensing circuit unpowered
   digitalWrite(
       WATER_DRIVE_PIN,
       LOW
@@ -542,7 +670,7 @@ bool readWaterPresenceRaw() {
 
   delayMicroseconds(100);
 
-  // Briefly energize the sensing circuit
+  // Briefly energize sensing circuit
   digitalWrite(
       WATER_DRIVE_PIN,
       HIGH
@@ -551,8 +679,11 @@ bool readWaterPresenceRaw() {
   delay(5);
 
   bool wet =
-      digitalRead(WATER_SENSE_PIN) == HIGH;
+      digitalRead(
+          WATER_SENSE_PIN
+      ) == HIGH;
 
+  // Immediately remove voltage
   digitalWrite(
       WATER_DRIVE_PIN,
       LOW
@@ -562,7 +693,7 @@ bool readWaterPresenceRaw() {
 }
 
 // ============================================================
-// LEVEL SENSOR
+// WATER LEVEL
 // ============================================================
 
 int readWaterLevelRaw() {
@@ -581,8 +712,6 @@ int readWaterLevelRaw() {
 
   bool level5 =
       digitalRead(LEVEL5_PIN);
-
-  // Highest active level wins
 
   if (level5)
     return 5;
@@ -603,10 +732,12 @@ int readWaterLevelRaw() {
 }
 
 // ============================================================
-// WATER LEVEL TEXT
+// LEVEL TEXT
 // ============================================================
 
-String waterLevelText(int level) {
+String waterLevelText(
+    int level
+) {
 
   switch (level) {
 
@@ -640,7 +771,8 @@ void handleWaterPresenceChange(
     bool newState
 ) {
 
-  waterPresence = newState;
+  waterPresence =
+      newState;
 
   if (newState) {
 
@@ -665,14 +797,15 @@ void handleWaterPresenceChange(
 }
 
 // ============================================================
-// LEVEL CHANGE
+// WATER LEVEL CHANGE
 // ============================================================
 
 void handleWaterLevelChange(
     int newLevel
 ) {
 
-  currentWaterLevel = newLevel;
+  currentWaterLevel =
+      newLevel;
 
   String message;
 
@@ -715,7 +848,8 @@ void updateSensors() {
     return;
   }
 
-  lastSensorRead = millis();
+  lastSensorRead =
+      millis();
 
   // ----------------------------------------------------------
   // WATER PRESENCE
@@ -724,7 +858,10 @@ void updateSensors() {
   bool rawWater =
       readWaterPresenceRaw();
 
-  if (rawWater != lastRawWaterPresence) {
+  if (
+      rawWater !=
+      lastRawWaterPresence
+  ) {
 
     lastRawWaterPresence =
         rawWater;
@@ -735,7 +872,8 @@ void updateSensors() {
 
   if (
       rawWater != waterPresence &&
-      millis() - waterCandidateSince >=
+      millis() -
+          waterCandidateSince >=
           WATER_DEBOUNCE_TIME
   ) {
 
@@ -751,7 +889,9 @@ void updateSensors() {
   int rawLevel =
       readWaterLevelRaw();
 
-  if (rawLevel != lastRawWaterLevel) {
+  if (
+      rawLevel != lastRawWaterLevel
+  ) {
 
     lastRawWaterLevel =
         rawLevel;
@@ -762,7 +902,8 @@ void updateSensors() {
 
   if (
       rawLevel != currentWaterLevel &&
-      millis() - levelCandidateSince >=
+      millis() -
+          levelCandidateSince >=
           LEVEL_DEBOUNCE_TIME
   ) {
 
@@ -779,7 +920,8 @@ void updateSensors() {
 String getUptime() {
 
   unsigned long seconds =
-      (millis() - bootTime) / 1000;
+      (millis() - bootTime) /
+      1000;
 
   unsigned long days =
       seconds / 86400;
@@ -812,17 +954,19 @@ String getUptime() {
 }
 
 // ============================================================
-// HTML HELPERS
+// HTML HEADER
 // ============================================================
 
 String htmlHeader(
     const String &title
 ) {
 
-  String html = R"rawliteral(
+  String html =
+      R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
+
 <meta name="viewport"
       content="width=device-width,initial-scale=1">
 
@@ -853,14 +997,6 @@ body {
   margin-bottom: 15px;
   border-radius: 12px;
   box-shadow: 0 2px 8px rgba(0,0,0,.08);
-}
-
-h1 {
-  margin-top: 0;
-}
-
-h2 {
-  margin-top: 0;
 }
 
 .grid {
@@ -927,6 +1063,7 @@ a {
 }
 
 </style>
+
 </head>
 
 <body>
@@ -939,7 +1076,7 @@ a {
 }
 
 // ============================================================
-// MAIN DASHBOARD
+// DASHBOARD
 // ============================================================
 
 void handleRoot() {
@@ -948,7 +1085,9 @@ void handleRoot() {
     return;
 
   String html =
-      htmlHeader("ESP32 Water Monitor");
+      htmlHeader(
+          "ESP32 Water Monitor"
+      );
 
   html += R"rawliteral(
 
@@ -957,11 +1096,23 @@ void handleRoot() {
 <h1>ESP32 Water Monitor</h1>
 
 <p>
-Firmware: <b>)rawliteral";
+Firmware:
+<b>)rawliteral";
 
   html += FIRMWARE_VERSION;
 
   html += R"rawliteral(</b>
+</p>
+
+<p>
+Local address:
+<b>
+http://)rawliteral";
+
+  html += MDNS_HOSTNAME;
+
+  html += R"rawliteral(.local
+</b>
 </p>
 
 </div>
@@ -972,20 +1123,26 @@ Firmware: <b>)rawliteral";
 
 <h2>Water Presence</h2>
 
-<div class="value">)rawliteral";
+<div class="value">
+)rawliteral";
 
   if (waterPresence) {
 
     html +=
-        "<span class=\"danger\">WATER DETECTED</span>";
+        "<span class=\"danger\">"
+        "WATER DETECTED"
+        "</span>";
 
   } else {
 
     html +=
-        "<span class=\"blue\">DRY</span>";
+        "<span class=\"blue\">"
+        "DRY"
+        "</span>";
   }
 
-  html += R"rawliteral(</div>
+  html += R"rawliteral(
+</div>
 
 </div>
 
@@ -993,17 +1150,21 @@ Firmware: <b>)rawliteral";
 
 <h2>Water Level</h2>
 
-<div class="value">)rawliteral";
+<div class="value">
+)rawliteral";
 
-  html += waterLevelText(
-      currentWaterLevel
-  );
+  html +=
+      waterLevelText(
+          currentWaterLevel
+      );
 
-  html += " (" +
-          String(currentWaterLevel) +
-          "/5)";
+  html +=
+      " (" +
+      String(currentWaterLevel) +
+      "/5)";
 
-  html += R"rawliteral(</div>
+  html += R"rawliteral(
+</div>
 
 </div>
 
@@ -1024,23 +1185,28 @@ Firmware: <b>)rawliteral";
     switch (i) {
 
       case 1:
-        active = digitalRead(LEVEL1_PIN);
+        active =
+            digitalRead(LEVEL1_PIN);
         break;
 
       case 2:
-        active = digitalRead(LEVEL2_PIN);
+        active =
+            digitalRead(LEVEL2_PIN);
         break;
 
       case 3:
-        active = digitalRead(LEVEL3_PIN);
+        active =
+            digitalRead(LEVEL3_PIN);
         break;
 
       case 4:
-        active = digitalRead(LEVEL4_PIN);
+        active =
+            digitalRead(LEVEL4_PIN);
         break;
 
       case 5:
-        active = digitalRead(LEVEL5_PIN);
+        active =
+            digitalRead(LEVEL5_PIN);
         break;
     }
 
@@ -1055,15 +1221,20 @@ Firmware: <b>)rawliteral";
     if (active) {
 
       html +=
-          "<div class=\"value good\">WET</div>";
+          "<div class=\"value good\">"
+          "WET"
+          "</div>";
 
     } else {
 
       html +=
-          "<div class=\"value\">DRY</div>";
+          "<div class=\"value\">"
+          "DRY"
+          "</div>";
     }
 
-    html += "</div>";
+    html +=
+        "</div>";
   }
 
   html += R"rawliteral(
@@ -1077,10 +1248,24 @@ Firmware: <b>)rawliteral";
 <h2>Network</h2>
 
 <p>
+mDNS:
+<b>
+http://)rawliteral";
+
+  html += MDNS_HOSTNAME;
+
+  html += R"rawliteral(.local
+</b>
+</p>
+
+<p>
 IPv4:
 <b>)rawliteral";
 
-  html += currentIPv4;
+  html +=
+      currentIPv4.length()
+          ? currentIPv4
+          : "Unavailable";
 
   html += R"rawliteral(</b>
 </p>
@@ -1101,10 +1286,23 @@ IPv6:
 RSSI:
 <b>)rawliteral";
 
-  html +=
-      String(WiFi.RSSI());
+  if (
+      WiFi.status() ==
+      WL_CONNECTED
+  ) {
 
-  html += R"rawliteral( dBm</b>
+    html +=
+        String(WiFi.RSSI()) +
+        " dBm";
+
+  } else {
+
+    html +=
+        "N/A";
+  }
+
+  html += R"rawliteral(
+</b>
 </p>
 
 <p>
@@ -1122,9 +1320,11 @@ DuckDNS:
 DuckDNS status:
 <b>)rawliteral";
 
-  html += duckDNSStatus;
+  html +=
+      duckDNSStatus;
 
-  html += R"rawliteral(</b>
+  html += R"rawliteral(
+</b>
 </p>
 
 </div>
@@ -1137,13 +1337,19 @@ DuckDNS status:
 Status:
 <b>)rawliteral";
 
-  html += telegramStatus;
+  html +=
+      telegramStatus;
 
-  html += R"rawliteral(</b>
+  html += R"rawliteral(
+</b>
 </p>
 
 <a href="/telegram-test">
-<button>Test Telegram</button>
+
+<button>
+Test Telegram
+</button>
+
 </a>
 
 </div>
@@ -1156,9 +1362,11 @@ Status:
 Uptime:
 <b>)rawliteral";
 
-  html += getUptime();
+  html +=
+      getUptime();
 
-  html += R"rawliteral(</b>
+  html += R"rawliteral(
+</b>
 </p>
 
 <p>
@@ -1166,18 +1374,24 @@ Free heap:
 <b>)rawliteral";
 
   html +=
-      String(ESP.getFreeHeap());
+      String(
+          ESP.getFreeHeap()
+      );
 
-  html += R"rawliteral( bytes</b>
+  html += R"rawliteral(
+ bytes
+</b>
 </p>
 
 <p>
 Chip:
 <b>)rawliteral";
 
-  html += ESP.getChipModel();
+  html +=
+      ESP.getChipModel();
 
-  html += R"rawliteral(</b>
+  html += R"rawliteral(
+</b>
 </p>
 
 <p>
@@ -1185,10 +1399,13 @@ CPU:
 <b>)rawliteral";
 
   html +=
-      String(ESP.getCpuFreqMHz()) +
+      String(
+          ESP.getCpuFreqMHz()
+      ) +
       " MHz";
 
-  html += R"rawliteral(</b>
+  html += R"rawliteral(
+</b>
 </p>
 
 </div>
@@ -1198,17 +1415,23 @@ CPU:
 <h2>Actions</h2>
 
 <a href="/wifi">
-<button>Wi-Fi Settings</button>
+<button>
+Wi-Fi Settings
+</button>
 </a>
 
 <a href="/update">
-<button>Firmware Update</button>
+<button>
+Firmware Update
+</button>
 </a>
 
 <a href="/restart"
    onclick="return confirm('Restart ESP32?');">
 
-<button>Restart</button>
+<button>
+Restart
+</button>
 
 </a>
 
@@ -1221,7 +1444,11 @@ CPU:
 <pre>
 )rawliteral";
 
-  for (int i = 0; i < logCount; i++) {
+  for (
+      int i = 0;
+      i < logCount;
+      i++
+  ) {
 
     html += logs[i];
 
@@ -1245,6 +1472,7 @@ setTimeout(function() {
 
 </body>
 </html>
+
 )rawliteral";
 
   server.send(
@@ -1270,7 +1498,9 @@ void handleWiFiPage() {
       );
 
   String html =
-      htmlHeader("Wi-Fi Settings");
+      htmlHeader(
+          "Wi-Fi Settings"
+      );
 
   html += R"rawliteral(
 
@@ -1281,7 +1511,9 @@ void handleWiFiPage() {
 <form method="POST"
       action="/savewifi">
 
-<label>Wi-Fi SSID</label>
+<label>
+Wi-Fi SSID
+</label>
 
 <input
   type="text"
@@ -1294,7 +1526,9 @@ void handleWiFiPage() {
   required
 >
 
-<label>Wi-Fi Password</label>
+<label>
+Wi-Fi Password
+</label>
 
 <input
   type="password"
@@ -1364,7 +1598,9 @@ void handleSaveWiFi() {
 
   ssid.trim();
 
-  if (ssid.length() == 0) {
+  if (
+      ssid.length() == 0
+  ) {
 
     server.send(
         400,
@@ -1478,7 +1714,9 @@ void handleUpdatePage() {
     return;
 
   String html =
-      htmlHeader("Firmware Update");
+      htmlHeader(
+          "Firmware Update"
+      );
 
   html += R"rawliteral(
 
@@ -1490,9 +1728,11 @@ void handleUpdatePage() {
 Current firmware:
 <b>)rawliteral";
 
-  html += FIRMWARE_VERSION;
+  html +=
+      FIRMWARE_VERSION;
 
-  html += R"rawliteral(</b>
+  html += R"rawliteral(
+</b>
 </p>
 
 <form
@@ -1517,7 +1757,8 @@ Upload Firmware
 </form>
 
 <p>
-Select the compiled ESP32 <b>.bin</b> file.
+Select the compiled ESP32
+<b>.bin</b> file.
 </p>
 
 <a href="/">
@@ -1567,7 +1808,9 @@ void handleFirmwareUpload() {
         )
     ) {
 
-      Update.printError(Serial);
+      Update.printError(
+          Serial
+      );
 
       addLog(
           "OTA Update.begin failed"
@@ -1583,10 +1826,13 @@ void handleFirmwareUpload() {
         Update.write(
             upload.buf,
             upload.currentSize
-        ) != upload.currentSize
+        ) !=
+        upload.currentSize
     ) {
 
-      Update.printError(Serial);
+      Update.printError(
+          Serial
+      );
 
       addLog(
           "OTA write failed"
@@ -1598,7 +1844,9 @@ void handleFirmwareUpload() {
       UPLOAD_FILE_END
   ) {
 
-    if (Update.end(true)) {
+    if (
+        Update.end(true)
+    ) {
 
       addLog(
           "OTA upload completed"
@@ -1606,7 +1854,9 @@ void handleFirmwareUpload() {
 
     } else {
 
-      Update.printError(Serial);
+      Update.printError(
+          Serial
+      );
 
       addLog(
           "OTA finalization failed"
@@ -1750,7 +2000,8 @@ void setup() {
 
   delay(500);
 
-  bootTime = millis();
+  bootTime =
+      millis();
 
   addLog(
       "================================"
@@ -1832,10 +2083,16 @@ void setup() {
 
   } else {
 
-    // Initial DuckDNS update
+    // --------------------------------------------------------
+    // DUCKDNS
+    // --------------------------------------------------------
+
     updateDuckDNS();
 
-    // Initial Telegram notification
+    // --------------------------------------------------------
+    // TELEGRAM STARTUP MESSAGE
+    // --------------------------------------------------------
+
     sendTelegram(
         "🟢 ESP32 Water Monitor started\n"
         "Firmware: " +
@@ -1844,9 +2101,9 @@ void setup() {
         currentIPv4 +
         "\nIPv6: " +
         (
-          currentIPv6.length()
-            ? currentIPv6
-            : "Unavailable"
+            currentIPv6.length()
+                ? currentIPv6
+                : "Unavailable"
         ),
         true
     );
@@ -1878,8 +2135,8 @@ void setup() {
       "Initial water presence: " +
       String(
           waterPresence
-            ? "WET"
-            : "DRY"
+              ? "WET"
+              : "DRY"
       )
   );
 
@@ -1922,6 +2179,11 @@ void loop() {
 
       wifiConnected = false;
 
+      currentIPv4 = "";
+      currentIPv6 = "";
+
+      stopMDNS();
+
       addLog(
           "Wi-Fi disconnected"
       );
@@ -1946,6 +2208,23 @@ void loop() {
           "Wi-Fi reconnected"
       );
 
+      addLog(
+          "IPv4: " +
+          currentIPv4
+      );
+
+      if (
+          currentIPv6.length() > 0
+      ) {
+
+        addLog(
+            "IPv6: " +
+            currentIPv6
+        );
+      }
+
+      startMDNS();
+
       updateDuckDNS();
     }
   }
@@ -1956,7 +2235,8 @@ void loop() {
 
   if (
       wifiConnected &&
-      millis() - lastDuckDNSUpdate >=
+      millis() -
+          lastDuckDNSUpdate >=
           DUCKDNS_UPDATE_INTERVAL
   ) {
 
