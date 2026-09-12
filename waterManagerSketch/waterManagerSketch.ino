@@ -1430,7 +1430,7 @@ String buildTelegramStatus() {
   // ----------------------------------------------------------
 
   message +=
-      "Presence: ";
+      "Manjeera (P25,P26): ";
 
   message +=
       waterPresence
@@ -1457,7 +1457,7 @@ String buildTelegramStatus() {
   // ----------------------------------------------------------
 
   message +=
-      "LEVEL SENSORS\n";
+      "LEVEL SENSORS (27, 32, 33, 16, 17)\n";
 
   for (
       int i = 0;
@@ -1512,15 +1512,6 @@ String buildTelegramStatus() {
           ")";
     }
 
-    message += "\n";
-
-    message +=
-        "RSSI: " +
-        String(
-            WiFi.RSSI()
-        ) +
-        " dBm\n";
-
   } else {
 
     message +=
@@ -1536,14 +1527,6 @@ String buildTelegramStatus() {
       ) +
       "\n";
 
-  message +=
-      "IPv6: " +
-      (
-          currentIPv6.length()
-              ? currentIPv6
-              : "Unavailable"
-      ) +
-      "\n";
 
   // ----------------------------------------------------------
   // DuckDNS
@@ -1552,27 +1535,11 @@ String buildTelegramStatus() {
   message += "\n";
 
   message +=
-      "DuckDNS: " +
+      "Domain: " +
       String(
           DUCKDNS_DOMAIN
       ) +
       ".duckdns.org\n";
-
-  message +=
-      "DuckDNS status: " +
-      duckDNSStatus +
-      "\n";
-
-  // ----------------------------------------------------------
-  // Telegram
-  // ----------------------------------------------------------
-
-  message += "\n";
-
-  message +=
-      "Telegram: " +
-      telegramStatus +
-      "\n";
 
   // ----------------------------------------------------------
   // System
@@ -1589,32 +1556,6 @@ String buildTelegramStatus() {
           FIRMWARE_VERSION
       ) +
       "\n";
-
-  message +=
-      "Uptime: " +
-      getUptime() +
-      "\n";
-
-  message +=
-      "Free heap: " +
-      String(
-          ESP.getFreeHeap()
-      ) +
-      " bytes\n";
-
-  message +=
-      "Chip: " +
-      String(
-          ESP.getChipModel()
-      ) +
-      "\n";
-
-  message +=
-      "CPU: " +
-      String(
-          ESP.getCpuFreqMHz()
-      ) +
-      " MHz";
 
   return message;
 }
@@ -3350,13 +3291,7 @@ void setup() {
             FIRMWARE_VERSION
         ) +
         "\nIPv4: " +
-        currentIPv4 +
-        "\nIPv6: " +
-        (
-            currentIPv6.length()
-                ? currentIPv6
-                : "Unavailable"
-        );
+        currentIPv4;
 
     sendTelegram(
         startupMessage,
