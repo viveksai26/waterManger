@@ -12,7 +12,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.1"
+#define FIRMWARE_VERSION "4.2"
 
 // ============================================================
 // mDNS
@@ -42,22 +42,49 @@ const unsigned long LEVEL_DEBOUNCE_TIME =
 const unsigned long TELEGRAM_COOLDOWN =
     30000UL;
 
+const unsigned long TELEGRAM_POLL_INTERVAL =
+    3000UL;
+
+// ============================================================
+// SENSOR FILTERING
+// ============================================================
+//
+// Each sensor is sampled 15 times.
+//
+// 12 or more HIGH readings = WET
+// 11 or fewer HIGH readings = DRY
+//
+// The result must then remain unchanged for 3 seconds before
+// being accepted as a confirmed state.
+//
+// ============================================================
+
+const int SENSOR_SAMPLE_COUNT =
+    15;
+
+const int SENSOR_WET_REQUIRED =
+    12;
+
+const unsigned long SENSOR_SAMPLE_DELAY_US =
+    500;
+
 // ============================================================
 // WATER PRESENCE SENSOR
 // ============================================================
 
 #define WATER_DRIVE_PIN 25
-#define WATER_SENSE_PIN 34
+#define WATER_SENSE_PIN 26
 
 // ============================================================
 // WATER LEVEL SENSORS
 // ============================================================
 
+#define LEVEL_COMMON_PIN 27
+
 #define LEVEL1_PIN 32
 #define LEVEL2_PIN 33
-#define LEVEL3_PIN 35
-#define LEVEL4_PIN 36
-#define LEVEL5_PIN 39
+#define LEVEL3_PIN 16
+#define LEVEL4_PIN 17
 
 // ============================================================
 // OBJECTS
@@ -75,31 +102,92 @@ bool wifiConnected = false;
 
 bool mdnsRunning = false;
 
+// ------------------------------------------------------------
+// Water presence
+// ------------------------------------------------------------
+
 bool waterPresence = false;
 bool lastRawWaterPresence = false;
 
 unsigned long waterCandidateSince = 0;
+
+// ------------------------------------------------------------
+// Water levels
+// ------------------------------------------------------------
 
 int currentWaterLevel = 0;
 int lastRawWaterLevel = 0;
 
 unsigned long levelCandidateSince = 0;
 
+// Confirmed individual level sensor states
+bool confirmedLevelSensors[4] = {
+    false,
+    false,
+    false,
+    false
+};
+
+// Pending filtered states
+bool pendingLevelSensors[4] = {
+    false,
+    false,
+    false,
+    false
+};
+
+// Time each pending level state started
+unsigned long levelSensorCandidateSince[4] = {
+    0,
+    0,
+    0,
+    0
+};
+
+// ============================================================
+// NETWORK STATE
+// ============================================================
+
 String currentIPv4 = "";
 String currentIPv6 = "";
 
-String duckDNSStatus = "Not updated";
-String lastDuckDNSIPv6 = "";
+String duckDNSStatus =
+    "Not updated";
 
-String telegramStatus = "Not tested";
+String lastDuckDNSIPv6 =
+    "";
 
-unsigned long lastDuckDNSUpdate = 0;
-unsigned long lastSensorRead = 0;
-unsigned long lastTelegramSent = 0;
+// ============================================================
+// TELEGRAM STATE
+// ============================================================
 
-bool otaRunning = false;
+String telegramStatus =
+    "Not tested";
 
-unsigned long bootTime = 0;
+unsigned long lastTelegramSent =
+    0;
+
+unsigned long lastTelegramPoll =
+    0;
+
+long telegramUpdateOffset =
+    0;
+
+// ============================================================
+// GENERAL STATE
+// ============================================================
+
+unsigned long lastDuckDNSUpdate =
+    0;
+
+unsigned long lastSensorRead =
+    0;
+
+bool otaRunning =
+    false;
+
+unsigned long bootTime =
+    0;
 
 // ============================================================
 // LOGGING
@@ -108,7 +196,12 @@ unsigned long bootTime = 0;
 #define MAX_LOGS 50
 
 String logs[MAX_LOGS];
+
 int logCount = 0;
+
+// ============================================================
+// ADD LOG
+// ============================================================
 
 void addLog(String message) {
 
@@ -120,15 +213,21 @@ void addLog(String message) {
 
   if (logCount < MAX_LOGS) {
 
-    logs[logCount++] = entry;
+    logs[logCount++] =
+        entry;
 
   } else {
 
-    for (int i = 0; i < MAX_LOGS - 1; i++) {
-      logs[i] = logs[i + 1];
+    for (int i = 0;
+         i < MAX_LOGS - 1;
+         i++) {
+
+      logs[i] =
+          logs[i + 1];
     }
 
-    logs[MAX_LOGS - 1] = entry;
+    logs[MAX_LOGS - 1] =
+        entry;
   }
 
   Serial.println(entry);
@@ -138,16 +237,23 @@ void addLog(String message) {
 // URL ENCODE
 // ============================================================
 
-String urlEncode(const String &text) {
+String urlEncode(
+    const String &text
+) {
 
   String encoded = "";
 
   const char *hex =
       "0123456789ABCDEF";
 
-  for (size_t i = 0; i < text.length(); i++) {
+  for (
+      size_t i = 0;
+      i < text.length();
+      i++
+  ) {
 
-    char c = text.charAt(i);
+    char c =
+        text.charAt(i);
 
     if (
         (c >= 'a' && c <= 'z') ||
@@ -164,8 +270,12 @@ String urlEncode(const String &text) {
     } else {
 
       encoded += '%';
-      encoded += hex[(c >> 4) & 0x0F];
-      encoded += hex[c & 0x0F];
+
+      encoded +=
+          hex[(c >> 4) & 0x0F];
+
+      encoded +=
+          hex[c & 0x0F];
     }
   }
 
@@ -205,16 +315,22 @@ void stopMDNS() {
 
     mdnsRunning = false;
 
-    addLog("mDNS stopped");
+    addLog(
+        "mDNS stopped"
+    );
   }
 }
+
+// ============================================================
 
 void startMDNS() {
 
   stopMDNS();
 
   if (
-      MDNS.begin(MDNS_HOSTNAME)
+      MDNS.begin(
+          MDNS_HOSTNAME
+      )
   ) {
 
     mdnsRunning = true;
@@ -233,7 +349,9 @@ void startMDNS() {
 
   } else {
 
-    addLog("mDNS failed to start");
+    addLog(
+        "mDNS failed to start"
+    );
   }
 }
 
@@ -246,6 +364,7 @@ String getIPv6Address() {
   if (
       !WiFi.STA.hasGlobalIPv6()
   ) {
+
     return "";
   }
 
@@ -273,7 +392,9 @@ bool connectToWiFi() {
           ""
       );
 
-  if (ssid.length() == 0) {
+  if (
+      ssid.length() == 0
+  ) {
 
     addLog(
         "No saved Wi-Fi credentials"
@@ -287,9 +408,13 @@ bool connectToWiFi() {
       ssid
   );
 
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(
+      WIFI_STA
+  );
 
-  WiFi.STA.enableIPv6(true);
+  WiFi.STA.enableIPv6(
+      true
+  );
 
   WiFi.begin(
       ssid.c_str(),
@@ -300,8 +425,10 @@ bool connectToWiFi() {
       millis();
 
   while (
-      WiFi.status() != WL_CONNECTED &&
-      millis() - start < WIFI_TIMEOUT
+      WiFi.status() !=
+          WL_CONNECTED &&
+      millis() - start <
+          WIFI_TIMEOUT
   ) {
 
     delay(500);
@@ -312,10 +439,12 @@ bool connectToWiFi() {
   Serial.println();
 
   if (
-      WiFi.status() != WL_CONNECTED
+      WiFi.status() !=
+      WL_CONNECTED
   ) {
 
-    wifiConnected = false;
+    wifiConnected =
+        false;
 
     addLog(
         "Wi-Fi connection failed"
@@ -324,7 +453,8 @@ bool connectToWiFi() {
     return false;
   }
 
-  wifiConnected = true;
+  wifiConnected =
+      true;
 
   currentIPv4 =
       WiFi.localIP().toString();
@@ -342,11 +472,13 @@ bool connectToWiFi() {
   // WAIT FOR GLOBAL IPV6
   // ----------------------------------------------------------
 
-  start = millis();
+  start =
+      millis();
 
   while (
       !WiFi.STA.hasGlobalIPv6() &&
-      millis() - start < 5000
+      millis() - start <
+          5000
   ) {
 
     delay(250);
@@ -388,7 +520,9 @@ void startSetupAP() {
 
   stopMDNS();
 
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(
+      WIFI_AP
+  );
 
   WiFi.softAP(
       AP_SSID,
@@ -408,15 +542,11 @@ void startSetupAP() {
       apIP.toString()
   );
 
-  // ----------------------------------------------------------
-  // mDNS on AP
-  // ----------------------------------------------------------
-
   startMDNS();
 
   addLog(
       "AP dashboard: http://" +
-      String(apIP.toString())
+      apIP.toString()
   );
 
   addLog(
@@ -457,14 +587,23 @@ bool updateDuckDNS() {
     return false;
   }
 
-  // No need to update if IPv6 hasn't changed
+  // ----------------------------------------------------------
+  // IPv6 unchanged
+  // ----------------------------------------------------------
+
   if (
-      ipv6 == lastDuckDNSIPv6 &&
+      ipv6 ==
+          lastDuckDNSIPv6 &&
       lastDuckDNSUpdate != 0
   ) {
 
     duckDNSStatus =
         "IPv6 unchanged";
+
+    // Reset the timer even when the address is unchanged.
+    // This prevents continuous retries every loop.
+    lastDuckDNSUpdate =
+        millis();
 
     return true;
   }
@@ -507,6 +646,8 @@ bool updateDuckDNS() {
     return false;
   }
 
+  http.setTimeout(5000);
+
   int httpCode =
       http.GET();
 
@@ -516,11 +657,13 @@ bool updateDuckDNS() {
   http.end();
 
   if (
-      httpCode == HTTP_CODE_OK &&
+      httpCode ==
+          HTTP_CODE_OK &&
       response.indexOf("OK") >= 0
   ) {
 
-    lastDuckDNSIPv6 = ipv6;
+    lastDuckDNSIPv6 =
+        ipv6;
 
     lastDuckDNSUpdate =
         millis();
@@ -550,36 +693,18 @@ bool updateDuckDNS() {
 }
 
 // ============================================================
-// TELEGRAM
+// TELEGRAM GENERIC REQUEST
 // ============================================================
 
-bool sendTelegram(
-    const String &message,
-    bool ignoreCooldown = false
+bool telegramRequest(
+    const String &url,
+    String &response
 ) {
 
   if (!wifiConnected) {
 
     telegramStatus =
         "Wi-Fi disconnected";
-
-    addLog(
-        "Telegram skipped: Wi-Fi disconnected"
-    );
-
-    return false;
-  }
-
-  if (
-      !ignoreCooldown &&
-      lastTelegramSent != 0 &&
-      millis() - lastTelegramSent <
-          TELEGRAM_COOLDOWN
-  ) {
-
-    addLog(
-        "Telegram skipped: cooldown"
-    );
 
     return false;
   }
@@ -589,17 +714,6 @@ bool sendTelegram(
   client.setInsecure();
 
   HTTPClient http;
-
-  String url =
-      "https://api.telegram.org/bot" +
-      String(TELEGRAM_BOT_TOKEN) +
-      "/sendMessage"
-      "?chat_id=" +
-      urlEncode(
-          String(TELEGRAM_CHAT_ID)
-      ) +
-      "&text=" +
-      urlEncode(message);
 
   if (
       !http.begin(
@@ -618,51 +732,232 @@ bool sendTelegram(
     return false;
   }
 
+  http.setTimeout(5000);
+
   int httpCode =
       http.GET();
 
-  String response =
+  response =
       http.getString();
 
   http.end();
 
   if (
-      httpCode == HTTP_CODE_OK &&
-      response.indexOf("\"ok\":true") >= 0
+      httpCode !=
+      HTTP_CODE_OK
   ) {
 
-    lastTelegramSent =
-        millis();
-
     telegramStatus =
-        "Last message sent successfully";
+        "HTTP error: " +
+        String(httpCode);
 
     addLog(
-        "Telegram message sent"
+        "Telegram HTTP error: " +
+        String(httpCode)
     );
 
-    return true;
+    return false;
   }
 
-  telegramStatus =
-      "Send failed: HTTP " +
-      String(httpCode);
+  if (
+      response.indexOf(
+          "\"ok\":true"
+      ) < 0
+  ) {
 
-  addLog(
-      "Telegram failed: HTTP " +
-      String(httpCode)
-  );
+    telegramStatus =
+        "Telegram API error";
 
-  return false;
+    addLog(
+        "Telegram API returned error"
+    );
+
+    return false;
+  }
+
+  return true;
 }
 
 // ============================================================
-// WATER PRESENCE
+// TELEGRAM SEND MESSAGE
 // ============================================================
 
-bool readWaterPresenceRaw() {
+bool sendTelegramMessage(
+    const String &message,
+    bool ignoreCooldown,
+    const String &replyMarkup
+) {
 
-  // Keep sensing circuit unpowered
+  if (!wifiConnected) {
+
+    telegramStatus =
+        "Wi-Fi disconnected";
+
+    addLog(
+        "Telegram skipped: Wi-Fi disconnected"
+    );
+
+    return false;
+  }
+
+  if (
+      !ignoreCooldown &&
+      lastTelegramSent != 0 &&
+      millis() -
+          lastTelegramSent <
+          TELEGRAM_COOLDOWN
+  ) {
+
+    addLog(
+        "Telegram skipped: cooldown"
+    );
+
+    return false;
+  }
+
+  String url =
+      "https://api.telegram.org/bot" +
+      String(TELEGRAM_BOT_TOKEN) +
+      "/sendMessage"
+      "?chat_id=" +
+      urlEncode(
+          String(TELEGRAM_CHAT_ID)
+      ) +
+      "&text=" +
+      urlEncode(
+          message
+      );
+
+  if (
+      replyMarkup.length() > 0
+  ) {
+
+    url +=
+        "&reply_markup=" +
+        urlEncode(
+            replyMarkup
+        );
+  }
+
+  String response;
+
+  if (
+      !telegramRequest(
+          url,
+          response
+      )
+  ) {
+
+    addLog(
+        "Telegram send failed"
+    );
+
+    return false;
+  }
+
+  lastTelegramSent =
+      millis();
+
+  telegramStatus =
+      "Last message sent successfully";
+
+  addLog(
+      "Telegram message sent"
+  );
+
+  return true;
+}
+
+// ============================================================
+// TELEGRAM NORMAL SEND
+// ============================================================
+
+bool sendTelegram(
+    const String &message,
+    bool ignoreCooldown = false
+) {
+
+  return sendTelegramMessage(
+      message,
+      ignoreCooldown,
+      ""
+  );
+}
+
+// ============================================================
+// TELEGRAM STATUS KEYBOARD
+// ============================================================
+
+bool sendTelegramStatusKeyboard() {
+
+  String keyboard =
+      "{\"keyboard\":[[{\"text\":\"/status\"}]],"
+      "\"resize_keyboard\":true,"
+      "\"one_time_keyboard\":false,"
+      "\"is_persistent\":true}";
+
+  return sendTelegramMessage(
+      "📊 Water Monitor commands\n"
+      "Press /status to get the current status.",
+      true,
+      keyboard
+  );
+}
+
+// ============================================================
+// TELEGRAM COMMAND REGISTRATION
+// ============================================================
+
+bool setupTelegramCommands() {
+
+  String commands =
+      "{\"commands\":["
+      "{\"command\":\"status\","
+      "\"description\":\"Get current water status\"}"
+      "]}";
+
+  String url =
+      "https://api.telegram.org/bot" +
+      String(TELEGRAM_BOT_TOKEN) +
+      "/setMyCommands"
+      "?commands=" +
+      urlEncode(
+          commands
+      );
+
+  String response;
+
+  if (
+      !telegramRequest(
+          url,
+          response
+      )
+  ) {
+
+    addLog(
+        "Telegram command registration failed"
+    );
+
+    return false;
+  }
+
+  addLog(
+      "Telegram /status command registered"
+  );
+
+  return true;
+}
+
+// ============================================================
+// WATER PRESENCE FILTER
+// ============================================================
+
+bool readWaterPresenceFiltered() {
+
+  int highCount = 0;
+
+  // Make absolutely sure the sensing circuit starts
+  // unpowered.
   digitalWrite(
       WATER_DRIVE_PIN,
       LOW
@@ -670,7 +965,7 @@ bool readWaterPresenceRaw() {
 
   delayMicroseconds(100);
 
-  // Briefly energize sensing circuit
+  // Briefly energize the sensing circuit.
   digitalWrite(
       WATER_DRIVE_PIN,
       HIGH
@@ -678,61 +973,147 @@ bool readWaterPresenceRaw() {
 
   delay(5);
 
-  bool wet =
-      digitalRead(
-          WATER_SENSE_PIN
-      ) == HIGH;
+  // ----------------------------------------------------------
+  // Multiple samples
+  // ----------------------------------------------------------
 
-  // Immediately remove voltage
+  for (
+      int i = 0;
+      i < SENSOR_SAMPLE_COUNT;
+      i++
+  ) {
+
+    if (
+        digitalRead(
+            WATER_SENSE_PIN
+        ) == HIGH
+    ) {
+
+      highCount++;
+    }
+
+    delayMicroseconds(
+        SENSOR_SAMPLE_DELAY_US
+    );
+  }
+
+  // Immediately remove voltage.
   digitalWrite(
       WATER_DRIVE_PIN,
       LOW
   );
 
-  return wet;
+  return (
+      highCount >=
+      SENSOR_WET_REQUIRED
+  );
 }
 
 // ============================================================
-// WATER LEVEL
+// LEVEL SENSOR FILTER
 // ============================================================
 
-int readWaterLevelRaw() {
+void readAllLevelSensorsFiltered(
+    bool states[4]
+) {
 
-  bool level1 =
-      digitalRead(LEVEL1_PIN);
+  int highCount[4] = {
+      0,
+      0,
+      0,
+      0
+  };
 
-  bool level2 =
-      digitalRead(LEVEL2_PIN);
+  // The bottom electrode is the common/reference electrode.
+  // Energize it only while taking the level measurements.
+  digitalWrite(
+      LEVEL_COMMON_PIN,
+      LOW
+  );
 
-  bool level3 =
-      digitalRead(LEVEL3_PIN);
+  delayMicroseconds(100);
 
-  bool level4 =
-      digitalRead(LEVEL4_PIN);
+  digitalWrite(
+      LEVEL_COMMON_PIN,
+      HIGH
+  );
 
-  bool level5 =
-      digitalRead(LEVEL5_PIN);
+  delayMicroseconds(100);
 
-  if (level5)
-    return 5;
+  // Sample all four independent level electrodes while the
+  // common/bottom electrode is energized.
+  for (
+      int i = 0;
+      i < SENSOR_SAMPLE_COUNT;
+      i++
+  ) {
 
-  if (level4)
+    if (digitalRead(LEVEL1_PIN) == HIGH)
+      highCount[0]++;
+
+    if (digitalRead(LEVEL2_PIN) == HIGH)
+      highCount[1]++;
+
+    if (digitalRead(LEVEL3_PIN) == HIGH)
+      highCount[2]++;
+
+    if (digitalRead(LEVEL4_PIN) == HIGH)
+      highCount[3]++;
+
+    delayMicroseconds(
+        SENSOR_SAMPLE_DELAY_US
+    );
+  }
+
+  // Immediately remove voltage from the electrodes.
+  digitalWrite(
+      LEVEL_COMMON_PIN,
+      LOW
+  );
+
+  for (
+      int i = 0;
+      i < 4;
+      i++
+  ) {
+    states[i] =
+        highCount[i] >= SENSOR_WET_REQUIRED;
+  }
+}
+
+
+
+// ============================================================
+// CALCULATE LEVEL FROM CONFIRMED SENSOR STATES
+// ============================================================
+
+int calculateConfirmedWaterLevel() {
+
+  if (
+      confirmedLevelSensors[3]
+  )
     return 4;
 
-  if (level3)
+  if (
+      confirmedLevelSensors[2]
+  )
     return 3;
 
-  if (level2)
+  if (
+      confirmedLevelSensors[1]
+  )
     return 2;
 
-  if (level1)
+  if (
+      confirmedLevelSensors[0]
+  )
     return 1;
 
   return 0;
 }
 
 // ============================================================
-// LEVEL TEXT
+// WATER LEVEL TEXT
 // ============================================================
 
 String waterLevelText(
@@ -809,12 +1190,16 @@ void handleWaterLevelChange(
 
   String message;
 
-  if (newLevel == 0) {
+  if (
+      newLevel == 0
+  ) {
 
     message =
         "🔵 WATER LEVEL: EMPTY";
 
-  } else if (newLevel == 5) {
+  } else if (
+      newLevel == 4
+  ) {
 
     message =
         "🔴 WATER LEVEL: FULL";
@@ -824,15 +1209,19 @@ void handleWaterLevelChange(
     message =
         "💧 WATER LEVEL: " +
         String(newLevel) +
-        "/5";
+        "/4";
   }
 
   addLog(
       "Water level changed: " +
-      waterLevelText(newLevel)
+      waterLevelText(
+          newLevel
+      )
   );
 
-  sendTelegram(message);
+  sendTelegram(
+      message
+  );
 }
 
 // ============================================================
@@ -842,75 +1231,148 @@ void handleWaterLevelChange(
 void updateSensors() {
 
   if (
-      millis() - lastSensorRead <
+      millis() -
+          lastSensorRead <
       SENSOR_INTERVAL
   ) {
+
     return;
   }
 
   lastSensorRead =
       millis();
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // WATER PRESENCE
-  // ----------------------------------------------------------
+  // ==========================================================
 
-  bool rawWater =
-      readWaterPresenceRaw();
+  bool filteredWater =
+      readWaterPresenceFiltered();
 
   if (
-      rawWater !=
+      filteredWater !=
       lastRawWaterPresence
   ) {
 
     lastRawWaterPresence =
-        rawWater;
+        filteredWater;
 
     waterCandidateSince =
         millis();
+
+    addLog(
+        "Water presence candidate: " +
+        String(
+            filteredWater
+                ? "WET"
+                : "DRY"
+        )
+    );
   }
 
   if (
-      rawWater != waterPresence &&
+      filteredWater !=
+          waterPresence &&
       millis() -
           waterCandidateSince >=
           WATER_DEBOUNCE_TIME
   ) {
 
     handleWaterPresenceChange(
-        rawWater
+        filteredWater
     );
   }
 
+  // ==========================================================
+  // WATER LEVEL SENSORS
+  // ==========================================================
+
+  bool filteredLevels[4];
+
+  readAllLevelSensorsFiltered(
+      filteredLevels
+  );
+
   // ----------------------------------------------------------
-  // WATER LEVEL
+  // Process each level independently
   // ----------------------------------------------------------
 
-  int rawLevel =
-      readWaterLevelRaw();
-
-  if (
-      rawLevel != lastRawWaterLevel
+  for (
+      int i = 0;
+      i < 4;
+      i++
   ) {
 
-    lastRawWaterLevel =
-        rawLevel;
+    if (
+        filteredLevels[i] !=
+        pendingLevelSensors[i]
+    ) {
 
-    levelCandidateSince =
-        millis();
+      pendingLevelSensors[i] =
+          filteredLevels[i];
+
+      levelSensorCandidateSince[i] =
+          millis();
+
+      addLog(
+          "Level " +
+          String(i + 1) +
+          " candidate: " +
+          String(
+              filteredLevels[i]
+                  ? "WET"
+                  : "DRY"
+          )
+      );
+    }
+
+    // --------------------------------------------------------
+    // Confirm individual sensor after 3 seconds
+    // --------------------------------------------------------
+
+    if (
+        filteredLevels[i] !=
+            confirmedLevelSensors[i] &&
+        millis() -
+            levelSensorCandidateSince[i] >=
+            LEVEL_DEBOUNCE_TIME
+    ) {
+
+      confirmedLevelSensors[i] =
+          filteredLevels[i];
+
+      addLog(
+          "Level " +
+          String(i + 1) +
+          " confirmed: " +
+          String(
+              confirmedLevelSensors[i]
+                  ? "WET"
+                  : "DRY"
+          )
+      );
+    }
   }
 
+  // ==========================================================
+  // CALCULATE OVERALL CONFIRMED LEVEL
+  // ==========================================================
+
+  int confirmedLevel =
+      calculateConfirmedWaterLevel();
+
   if (
-      rawLevel != currentWaterLevel &&
-      millis() -
-          levelCandidateSince >=
-          LEVEL_DEBOUNCE_TIME
+      confirmedLevel !=
+      currentWaterLevel
   ) {
 
     handleWaterLevelChange(
-        rawLevel
+        confirmedLevel
     );
   }
+
+  lastRawWaterLevel =
+      confirmedLevel;
 }
 
 // ============================================================
@@ -920,7 +1382,8 @@ void updateSensors() {
 String getUptime() {
 
   unsigned long seconds =
-      (millis() - bootTime) /
+      (millis() -
+       bootTime) /
       1000;
 
   unsigned long days =
@@ -954,6 +1417,670 @@ String getUptime() {
 }
 
 // ============================================================
+// TELEGRAM STATUS MESSAGE
+// ============================================================
+
+String buildTelegramStatus() {
+
+  String message =
+      "💧 WATER MONITOR STATUS\n\n";
+
+  // ----------------------------------------------------------
+  // Presence
+  // ----------------------------------------------------------
+
+  message +=
+      "Presence: ";
+
+  message +=
+      waterPresence
+          ? "💧 WATER DETECTED"
+          : "🔵 DRY";
+
+  message += "\n";
+
+  // ----------------------------------------------------------
+  // Overall level
+  // ----------------------------------------------------------
+
+  message +=
+      "Water Level: " +
+      waterLevelText(
+          currentWaterLevel
+      ) +
+      " (" +
+      String(currentWaterLevel) +
+      "/4)\n\n";
+
+  // ----------------------------------------------------------
+  // Individual sensors
+  // ----------------------------------------------------------
+
+  message +=
+      "LEVEL SENSORS\n";
+
+  for (
+      int i = 0;
+      i < 4;
+      i++
+  ) {
+
+    message +=
+        "L" +
+        String(i + 1) +
+        ": ";
+
+    message +=
+        confirmedLevelSensors[i]
+            ? "WET"
+            : "DRY";
+
+    message += "\n";
+  }
+
+  message += "\n";
+
+  // ----------------------------------------------------------
+  // Wi-Fi
+  // ----------------------------------------------------------
+
+  message +=
+      "NETWORK\n";
+
+  if (
+      wifiConnected &&
+      WiFi.status() ==
+          WL_CONNECTED
+  ) {
+
+    String ssid =
+        preferences.getString(
+            "ssid",
+            ""
+        );
+
+    message +=
+        "WiFi: CONNECTED";
+
+    if (
+        ssid.length() > 0
+    ) {
+
+      message +=
+          " (" +
+          ssid +
+          ")";
+    }
+
+    message += "\n";
+
+    message +=
+        "RSSI: " +
+        String(
+            WiFi.RSSI()
+        ) +
+        " dBm\n";
+
+  } else {
+
+    message +=
+        "WiFi: DISCONNECTED\n";
+  }
+
+  message +=
+      "IPv4: " +
+      (
+          currentIPv4.length()
+              ? currentIPv4
+              : "Unavailable"
+      ) +
+      "\n";
+
+  message +=
+      "IPv6: " +
+      (
+          currentIPv6.length()
+              ? currentIPv6
+              : "Unavailable"
+      ) +
+      "\n";
+
+  // ----------------------------------------------------------
+  // DuckDNS
+  // ----------------------------------------------------------
+
+  message += "\n";
+
+  message +=
+      "DuckDNS: " +
+      String(
+          DUCKDNS_DOMAIN
+      ) +
+      ".duckdns.org\n";
+
+  message +=
+      "DuckDNS status: " +
+      duckDNSStatus +
+      "\n";
+
+  // ----------------------------------------------------------
+  // Telegram
+  // ----------------------------------------------------------
+
+  message += "\n";
+
+  message +=
+      "Telegram: " +
+      telegramStatus +
+      "\n";
+
+  // ----------------------------------------------------------
+  // System
+  // ----------------------------------------------------------
+
+  message += "\n";
+
+  message +=
+      "SYSTEM\n";
+
+  message +=
+      "Firmware: V" +
+      String(
+          FIRMWARE_VERSION
+      ) +
+      "\n";
+
+  message +=
+      "Uptime: " +
+      getUptime() +
+      "\n";
+
+  message +=
+      "Free heap: " +
+      String(
+          ESP.getFreeHeap()
+      ) +
+      " bytes\n";
+
+  message +=
+      "Chip: " +
+      String(
+          ESP.getChipModel()
+      ) +
+      "\n";
+
+  message +=
+      "CPU: " +
+      String(
+          ESP.getCpuFreqMHz()
+      ) +
+      " MHz";
+
+  return message;
+}
+
+// ============================================================
+// TELEGRAM JSON NUMBER EXTRACTION
+// ============================================================
+
+String extractJsonNumber(
+    const String &json,
+    const String &key,
+    int startAt
+) {
+
+  String searchKey =
+      "\"" +
+      key +
+      "\"";
+
+  int keyPos =
+      json.indexOf(
+          searchKey,
+          startAt
+      );
+
+  if (
+      keyPos < 0
+  ) {
+
+    return "";
+  }
+
+  int colonPos =
+      json.indexOf(
+          ':',
+          keyPos +
+          searchKey.length()
+      );
+
+  if (
+      colonPos < 0
+  ) {
+
+    return "";
+  }
+
+  int start =
+      colonPos + 1;
+
+  while (
+      start <
+          (int)json.length() &&
+      (
+          json.charAt(start) ==
+              ' ' ||
+          json.charAt(start) ==
+              '\t'
+      )
+  ) {
+
+    start++;
+  }
+
+  int end =
+      start;
+
+  if (
+      end <
+          (int)json.length() &&
+      json.charAt(end) ==
+          '-'
+  ) {
+
+    end++;
+  }
+
+  while (
+      end <
+          (int)json.length() &&
+      isDigit(
+          json.charAt(end)
+      )
+  ) {
+
+    end++;
+  }
+
+  return json.substring(
+      start,
+      end
+  );
+}
+
+// ============================================================
+// TELEGRAM JSON STRING EXTRACTION
+// ============================================================
+
+String extractJsonString(
+    const String &json,
+    const String &key,
+    int startAt
+) {
+
+  String searchKey =
+      "\"" +
+      key +
+      "\"";
+
+  int keyPos =
+      json.indexOf(
+          searchKey,
+          startAt
+      );
+
+  if (
+      keyPos < 0
+  ) {
+
+    return "";
+  }
+
+  int colonPos =
+      json.indexOf(
+          ':',
+          keyPos +
+          searchKey.length()
+      );
+
+  if (
+      colonPos < 0
+  ) {
+
+    return "";
+  }
+
+  int quoteStart =
+      json.indexOf(
+          '"',
+          colonPos + 1
+      );
+
+  if (
+      quoteStart < 0
+  ) {
+
+    return "";
+  }
+
+  String result = "";
+
+  bool escaped =
+      false;
+
+  for (
+      int i =
+          quoteStart + 1;
+      i < (int)json.length();
+      i++
+  ) {
+
+    char c =
+        json.charAt(i);
+
+    if (escaped) {
+
+      switch (c) {
+
+        case 'n':
+          result += '\n';
+          break;
+
+        case 'r':
+          result += '\r';
+          break;
+
+        case 't':
+          result += '\t';
+          break;
+
+        case '"':
+          result += '"';
+          break;
+
+        case '\\':
+          result += '\\';
+          break;
+
+        default:
+          result += c;
+          break;
+      }
+
+      escaped =
+          false;
+
+      continue;
+    }
+
+    if (c == '\\') {
+
+      escaped =
+          true;
+
+      continue;
+    }
+
+    if (c == '"') {
+
+      break;
+    }
+
+    result += c;
+  }
+
+  return result;
+}
+
+// ============================================================
+// TELEGRAM POLLING
+// ============================================================
+
+void pollTelegram() {
+
+  if (!wifiConnected) {
+
+    return;
+  }
+
+  if (
+      millis() -
+          lastTelegramPoll <
+      TELEGRAM_POLL_INTERVAL
+  ) {
+
+    return;
+  }
+
+  lastTelegramPoll =
+      millis();
+
+  String url =
+      "https://api.telegram.org/bot" +
+      String(TELEGRAM_BOT_TOKEN) +
+      "/getUpdates"
+      "?offset=" +
+      String(
+          telegramUpdateOffset
+      ) +
+      "&limit=5"
+      "&timeout=0";
+
+  String response;
+
+  if (
+      !telegramRequest(
+          url,
+          response
+      )
+  ) {
+
+    addLog(
+        "Telegram polling failed"
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Find all returned updates
+  // ----------------------------------------------------------
+
+  int searchPosition =
+      0;
+
+  bool foundUpdate =
+      false;
+
+  while (true) {
+
+    int updatePosition =
+        response.indexOf(
+            "\"update_id\"",
+            searchPosition
+        );
+
+    if (
+        updatePosition < 0
+    ) {
+
+      break;
+    }
+
+    foundUpdate =
+        true;
+
+    String updateIdString =
+        extractJsonNumber(
+            response,
+            "update_id",
+            updatePosition
+        );
+
+    long updateId =
+        updateIdString.toInt();
+
+    if (
+        updateId >=
+        telegramUpdateOffset
+    ) {
+
+      telegramUpdateOffset =
+          updateId + 1;
+    }
+
+    // --------------------------------------------------------
+    // Find message object belonging to this update
+    // --------------------------------------------------------
+
+    int messagePosition =
+        response.indexOf(
+            "\"message\"",
+            updatePosition
+        );
+
+    if (
+        messagePosition < 0
+    ) {
+
+      searchPosition =
+          updatePosition + 1;
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // Find chat object
+    // --------------------------------------------------------
+
+    int chatPosition =
+        response.indexOf(
+            "\"chat\"",
+            messagePosition
+        );
+
+    if (
+        chatPosition < 0
+    ) {
+
+      searchPosition =
+          updatePosition + 1;
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // Extract chat ID
+    // --------------------------------------------------------
+
+    String chatId =
+        extractJsonNumber(
+            response,
+            "id",
+            chatPosition
+        );
+
+    // --------------------------------------------------------
+    // Extract message text
+    // --------------------------------------------------------
+
+    String text =
+        extractJsonString(
+            response,
+            "text",
+            messagePosition
+        );
+
+    // --------------------------------------------------------
+    // Only accept our configured chat
+    // --------------------------------------------------------
+
+    if (
+        chatId !=
+        String(
+            TELEGRAM_CHAT_ID
+        )
+    ) {
+
+      searchPosition =
+          updatePosition + 1;
+
+      continue;
+    }
+
+    if (
+        text.length() == 0
+    ) {
+
+      searchPosition =
+          updatePosition + 1;
+
+      continue;
+    }
+
+    addLog(
+        "Telegram command received: " +
+        text
+    );
+
+    // --------------------------------------------------------
+    // /status
+    //
+    // Accept:
+    // /status
+    // /status@BotName
+    // --------------------------------------------------------
+
+    if (
+        text == "/status" ||
+        text.startsWith(
+            "/status@"
+        )
+    ) {
+
+      String statusMessage =
+          buildTelegramStatus();
+
+      sendTelegram(
+          statusMessage,
+          true
+      );
+    }
+
+    // --------------------------------------------------------
+    // /start
+    // --------------------------------------------------------
+
+    else if (
+        text == "/start" ||
+        text.startsWith(
+            "/start@"
+        )
+    ) {
+
+      sendTelegramStatusKeyboard();
+
+      sendTelegram(
+          "🟢 ESP32 Water Monitor\n"
+          "Use /status to get the current water status.",
+          true
+      );
+    }
+
+    searchPosition =
+        updatePosition + 1;
+  }
+
+  if (
+      foundUpdate
+  ) {
+
+    telegramStatus =
+        "Listening for /status";
+  }
+}
+
+// ============================================================
 // HTML HEADER
 // ============================================================
 
@@ -972,9 +2099,11 @@ String htmlHeader(
 
 <title>)rawliteral";
 
-  html += title;
+  html +=
+      title;
 
-  html += R"rawliteral(</title>
+  html +=
+      R"rawliteral(</title>
 
 <style>
 
@@ -1089,7 +2218,8 @@ void handleRoot() {
           "ESP32 Water Monitor"
       );
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 
 <div class="card">
 
@@ -1099,9 +2229,11 @@ void handleRoot() {
 Firmware:
 <b>)rawliteral";
 
-  html += FIRMWARE_VERSION;
+  html +=
+      FIRMWARE_VERSION;
 
-  html += R"rawliteral(</b>
+  html +=
+      R"rawliteral(</b>
 </p>
 
 <p>
@@ -1109,9 +2241,11 @@ Local address:
 <b>
 http://)rawliteral";
 
-  html += MDNS_HOSTNAME;
+  html +=
+      MDNS_HOSTNAME;
 
-  html += R"rawliteral(.local
+  html +=
+      R"rawliteral(.local
 </b>
 </p>
 
@@ -1141,7 +2275,8 @@ http://)rawliteral";
         "</span>";
   }
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </div>
 
 </div>
@@ -1160,10 +2295,13 @@ http://)rawliteral";
 
   html +=
       " (" +
-      String(currentWaterLevel) +
-      "/5)";
+      String(
+          currentWaterLevel
+      ) +
+      "/4)";
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </div>
 
 </div>
@@ -1178,44 +2316,21 @@ http://)rawliteral";
 
 )rawliteral";
 
-  for (int i = 1; i <= 5; i++) {
+  for (
+      int i = 0;
+      i < 4;
+      i++
+  ) {
 
-    bool active = false;
-
-    switch (i) {
-
-      case 1:
-        active =
-            digitalRead(LEVEL1_PIN);
-        break;
-
-      case 2:
-        active =
-            digitalRead(LEVEL2_PIN);
-        break;
-
-      case 3:
-        active =
-            digitalRead(LEVEL3_PIN);
-        break;
-
-      case 4:
-        active =
-            digitalRead(LEVEL4_PIN);
-        break;
-
-      case 5:
-        active =
-            digitalRead(LEVEL5_PIN);
-        break;
-    }
+    bool active =
+        confirmedLevelSensors[i];
 
     html +=
         "<div class=\"card\">";
 
     html +=
         "<h2>Level " +
-        String(i) +
+        String(i + 1) +
         "</h2>";
 
     if (active) {
@@ -1237,7 +2352,8 @@ http://)rawliteral";
         "</div>";
   }
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 
 </div>
 
@@ -1252,9 +2368,11 @@ mDNS:
 <b>
 http://)rawliteral";
 
-  html += MDNS_HOSTNAME;
+  html +=
+      MDNS_HOSTNAME;
 
-  html += R"rawliteral(.local
+  html +=
+      R"rawliteral(.local
 </b>
 </p>
 
@@ -1267,7 +2385,8 @@ IPv4:
           ? currentIPv4
           : "Unavailable";
 
-  html += R"rawliteral(</b>
+  html +=
+      R"rawliteral(</b>
 </p>
 
 <p>
@@ -1279,7 +2398,8 @@ IPv6:
           ? currentIPv6
           : "Unavailable";
 
-  html += R"rawliteral(</b>
+  html +=
+      R"rawliteral(</b>
 </p>
 
 <p>
@@ -1292,7 +2412,9 @@ RSSI:
   ) {
 
     html +=
-        String(WiFi.RSSI()) +
+        String(
+            WiFi.RSSI()
+        ) +
         " dBm";
 
   } else {
@@ -1301,7 +2423,8 @@ RSSI:
         "N/A";
   }
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </b>
 </p>
 
@@ -1310,10 +2433,13 @@ DuckDNS:
 <b>)rawliteral";
 
   html +=
-      String(DUCKDNS_DOMAIN) +
+      String(
+          DUCKDNS_DOMAIN
+      ) +
       ".duckdns.org";
 
-  html += R"rawliteral(</b>
+  html +=
+      R"rawliteral(</b>
 </p>
 
 <p>
@@ -1323,7 +2449,8 @@ DuckDNS status:
   html +=
       duckDNSStatus;
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </b>
 </p>
 
@@ -1340,8 +2467,14 @@ Status:
   html +=
       telegramStatus;
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </b>
+</p>
+
+<p>
+Commands:
+<b>/status</b>
 </p>
 
 <a href="/telegram-test">
@@ -1365,7 +2498,8 @@ Uptime:
   html +=
       getUptime();
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </b>
 </p>
 
@@ -1378,7 +2512,8 @@ Free heap:
           ESP.getFreeHeap()
       );
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
  bytes
 </b>
 </p>
@@ -1390,7 +2525,8 @@ Chip:
   html +=
       ESP.getChipModel();
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </b>
 </p>
 
@@ -1404,7 +2540,8 @@ CPU:
       ) +
       " MHz";
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </b>
 </p>
 
@@ -1450,12 +2587,15 @@ Restart
       i++
   ) {
 
-    html += logs[i];
+    html +=
+        logs[i];
 
-    html += "\n";
+    html +=
+        "\n";
   }
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </pre>
 
 </div>
@@ -1502,7 +2642,8 @@ void handleWiFiPage() {
           "Wi-Fi Settings"
       );
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 
 <div class="card">
 
@@ -1520,9 +2661,11 @@ Wi-Fi SSID
   name="ssid"
   value=")rawliteral";
 
-  html += savedSSID;
+  html +=
+      savedSSID;
 
-  html += R"rawliteral("
+  html +=
+      R"rawliteral("
   required
 >
 
@@ -1675,7 +2818,9 @@ void handleTelegramTest() {
           "🟢 ESP32 Water Monitor\n"
           "Telegram test successful.\n"
           "Firmware: " +
-          String(FIRMWARE_VERSION),
+          String(
+              FIRMWARE_VERSION
+          ),
           true
       );
 
@@ -1718,7 +2863,8 @@ void handleUpdatePage() {
           "Firmware Update"
       );
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 
 <div class="card">
 
@@ -1731,7 +2877,8 @@ Current firmware:
   html +=
       FIRMWARE_VERSION;
 
-  html += R"rawliteral(
+  html +=
+      R"rawliteral(
 </b>
 </p>
 
@@ -1795,7 +2942,8 @@ void handleFirmwareUpload() {
       UPLOAD_FILE_START
   ) {
 
-    otaRunning = true;
+    otaRunning =
+        true;
 
     addLog(
         "OTA upload started: " +
@@ -1863,7 +3011,8 @@ void handleFirmwareUpload() {
       );
     }
 
-    otaRunning = false;
+    otaRunning =
+        false;
 
   } else if (
       upload.status ==
@@ -1872,7 +3021,8 @@ void handleFirmwareUpload() {
 
     Update.abort();
 
-    otaRunning = false;
+    otaRunning =
+        false;
 
     addLog(
         "OTA upload aborted"
@@ -1991,12 +3141,97 @@ void setupWebServer() {
 }
 
 // ============================================================
+// INITIALIZE FILTERED SENSOR STATES
+// ============================================================
+
+void initializeSensors() {
+
+  addLog(
+      "Taking initial filtered sensor readings..."
+  );
+
+  // ----------------------------------------------------------
+  // Presence
+  // ----------------------------------------------------------
+
+  waterPresence =
+      readWaterPresenceFiltered();
+
+  lastRawWaterPresence =
+      waterPresence;
+
+  waterCandidateSince =
+      millis();
+
+  // ----------------------------------------------------------
+  // Level sensors
+  // ----------------------------------------------------------
+
+  bool initialLevels[4];
+
+  readAllLevelSensorsFiltered(
+      initialLevels
+  );
+
+  for (
+      int i = 0;
+      i < 4;
+      i++
+  ) {
+
+    confirmedLevelSensors[i] =
+        initialLevels[i];
+
+    pendingLevelSensors[i] =
+        initialLevels[i];
+
+    levelSensorCandidateSince[i] =
+        millis();
+
+    addLog(
+        "Initial Level " +
+        String(i + 1) +
+        ": " +
+        String(
+            initialLevels[i]
+                ? "WET"
+                : "DRY"
+        )
+    );
+  }
+
+  currentWaterLevel =
+      calculateConfirmedWaterLevel();
+
+  lastRawWaterLevel =
+      currentWaterLevel;
+
+  addLog(
+      "Initial water presence: " +
+      String(
+          waterPresence
+              ? "WET"
+              : "DRY"
+      )
+  );
+
+  addLog(
+      "Initial water level: " +
+      waterLevelText(
+          currentWaterLevel
+      )
+  );
+}
+
+// ============================================================
 // SETUP
 // ============================================================
 
 void setup() {
 
-  Serial.begin(115200);
+  Serial.begin(
+      115200
+  );
 
   delay(500);
 
@@ -2009,7 +3244,9 @@ void setup() {
 
   addLog(
       "ESP32 Water Monitor V" +
-      String(FIRMWARE_VERSION)
+      String(
+          FIRMWARE_VERSION
+      )
   );
 
   addLog(
@@ -2041,32 +3278,37 @@ void setup() {
 
   pinMode(
       WATER_SENSE_PIN,
-      INPUT
+      INPUT_PULLDOWN
+  );
+
+  pinMode(
+      LEVEL_COMMON_PIN,
+      OUTPUT
+  );
+
+  digitalWrite(
+      LEVEL_COMMON_PIN,
+      LOW
   );
 
   pinMode(
       LEVEL1_PIN,
-      INPUT
+      INPUT_PULLDOWN
   );
 
   pinMode(
       LEVEL2_PIN,
-      INPUT
+      INPUT_PULLDOWN
   );
 
   pinMode(
       LEVEL3_PIN,
-      INPUT
+      INPUT_PULLDOWN
   );
 
   pinMode(
       LEVEL4_PIN,
-      INPUT
-  );
-
-  pinMode(
-      LEVEL5_PIN,
-      INPUT
+      INPUT_PULLDOWN
   );
 
   addLog(
@@ -2077,7 +3319,9 @@ void setup() {
   // WIFI
   // ----------------------------------------------------------
 
-  if (!connectToWiFi()) {
+  if (
+      !connectToWiFi()
+  ) {
 
     startSetupAP();
 
@@ -2090,13 +3334,21 @@ void setup() {
     updateDuckDNS();
 
     // --------------------------------------------------------
+    // TELEGRAM COMMANDS
+    // --------------------------------------------------------
+
+    setupTelegramCommands();
+
+    // --------------------------------------------------------
     // TELEGRAM STARTUP MESSAGE
     // --------------------------------------------------------
 
-    sendTelegram(
+    String startupMessage =
         "🟢 ESP32 Water Monitor started\n"
         "Firmware: " +
-        String(FIRMWARE_VERSION) +
+        String(
+            FIRMWARE_VERSION
+        ) +
         "\nIPv4: " +
         currentIPv4 +
         "\nIPv6: " +
@@ -2104,9 +3356,18 @@ void setup() {
             currentIPv6.length()
                 ? currentIPv6
                 : "Unavailable"
-        ),
+        );
+
+    sendTelegram(
+        startupMessage,
         true
     );
+
+    // --------------------------------------------------------
+    // Show /status button
+    // --------------------------------------------------------
+
+    sendTelegramStatusKeyboard();
   }
 
   // ----------------------------------------------------------
@@ -2116,36 +3377,10 @@ void setup() {
   setupWebServer();
 
   // ----------------------------------------------------------
-  // INITIAL SENSOR STATE
+  // INITIAL FILTERED SENSOR STATE
   // ----------------------------------------------------------
 
-  waterPresence =
-      readWaterPresenceRaw();
-
-  lastRawWaterPresence =
-      waterPresence;
-
-  currentWaterLevel =
-      readWaterLevelRaw();
-
-  lastRawWaterLevel =
-      currentWaterLevel;
-
-  addLog(
-      "Initial water presence: " +
-      String(
-          waterPresence
-              ? "WET"
-              : "DRY"
-      )
-  );
-
-  addLog(
-      "Initial water level: " +
-      waterLevelText(
-          currentWaterLevel
-      )
-  );
+  initializeSensors();
 
   addLog(
       "System ready"
@@ -2158,6 +3393,10 @@ void setup() {
 
 void loop() {
 
+  // ----------------------------------------------------------
+  // WEB SERVER
+  // ----------------------------------------------------------
+
   server.handleClient();
 
   // ----------------------------------------------------------
@@ -2167,20 +3406,32 @@ void loop() {
   updateSensors();
 
   // ----------------------------------------------------------
+  // TELEGRAM POLLING
+  // ----------------------------------------------------------
+
+  pollTelegram();
+
+  // ----------------------------------------------------------
   // WIFI RECONNECT
   // ----------------------------------------------------------
 
   if (
-      WiFi.getMode() == WIFI_STA &&
-      WiFi.status() != WL_CONNECTED
+      WiFi.getMode() ==
+          WIFI_STA &&
+      WiFi.status() !=
+          WL_CONNECTED
   ) {
 
     if (wifiConnected) {
 
-      wifiConnected = false;
+      wifiConnected =
+          false;
 
-      currentIPv4 = "";
-      currentIPv6 = "";
+      currentIPv4 =
+          "";
+
+      currentIPv6 =
+          "";
 
       stopMDNS();
 
@@ -2190,13 +3441,16 @@ void loop() {
     }
 
   } else if (
-      WiFi.getMode() == WIFI_STA &&
-      WiFi.status() == WL_CONNECTED
+      WiFi.getMode() ==
+          WIFI_STA &&
+      WiFi.status() ==
+          WL_CONNECTED
   ) {
 
     if (!wifiConnected) {
 
-      wifiConnected = true;
+      wifiConnected =
+          true;
 
       currentIPv4 =
           WiFi.localIP().toString();
@@ -2226,6 +3480,8 @@ void loop() {
       startMDNS();
 
       updateDuckDNS();
+
+      setupTelegramCommands();
     }
   }
 
@@ -2242,6 +3498,10 @@ void loop() {
 
     updateDuckDNS();
   }
+
+  // ----------------------------------------------------------
+  // Small yield
+  // ----------------------------------------------------------
 
   delay(5);
 }
