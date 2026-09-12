@@ -12,7 +12,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.2"
+#define FIRMWARE_VERSION "4.3"
 
 // ============================================================
 // mDNS
@@ -43,7 +43,7 @@ const unsigned long TELEGRAM_COOLDOWN =
     30000UL;
 
 const unsigned long TELEGRAM_POLL_INTERVAL =
-    3000UL;
+    5000UL;
 
 // ============================================================
 // SENSOR FILTERING
@@ -218,9 +218,11 @@ void addLog(String message) {
 
   } else {
 
-    for (int i = 0;
-         i < MAX_LOGS - 1;
-         i++) {
+    for (
+        int i = 0;
+        i < MAX_LOGS - 1;
+        i++
+    ) {
 
       logs[i] =
           logs[i + 1];
@@ -617,6 +619,8 @@ bool updateDuckDNS() {
 
   client.setInsecure();
 
+  client.setTimeout(5000);
+
   HTTPClient http;
 
   String url =
@@ -643,8 +647,14 @@ bool updateDuckDNS() {
         "DuckDNS HTTP begin failed"
     );
 
+    client.stop();
+
     return false;
   }
+
+  http.setReuse(false);
+
+  http.setConnectTimeout(5000);
 
   http.setTimeout(5000);
 
@@ -655,6 +665,8 @@ bool updateDuckDNS() {
       http.getString();
 
   http.end();
+
+  client.stop();
 
   if (
       httpCode ==
@@ -709,73 +721,172 @@ bool telegramRequest(
     return false;
   }
 
-  WiFiClientSecure client;
+  // ----------------------------------------------------------
+  // Try twice.
+  //
+  // A negative HTTPClient result means that the ESP32 failed
+  // at the connection level before receiving an HTTP response.
+  // ----------------------------------------------------------
 
-  client.setInsecure();
-
-  HTTPClient http;
-
-  if (
-      !http.begin(
-          client,
-          url
-      )
+  for (
+      int attempt = 1;
+      attempt <= 2;
+      attempt++
   ) {
 
-    telegramStatus =
-        "HTTPS connection failed";
+    WiFiClientSecure client;
+
+    client.setInsecure();
+
+    client.setTimeout(5000);
+
+    HTTPClient http;
+
+    // --------------------------------------------------------
+    // HTTPS connection
+    // --------------------------------------------------------
+
+    if (
+        !http.begin(
+            client,
+            url
+        )
+    ) {
+
+      telegramStatus =
+          "HTTPS connection failed";
+
+      addLog(
+          "Telegram HTTP begin failed "
+          "(attempt " +
+          String(attempt) +
+          "/2)"
+      );
+
+      http.end();
+
+      client.stop();
+
+      if (attempt == 1) {
+
+        delay(250);
+      }
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // Do not reuse old Telegram HTTPS connections.
+    // --------------------------------------------------------
+
+    http.setReuse(false);
+
+    http.setConnectTimeout(5000);
+
+    http.setTimeout(5000);
+
+    // --------------------------------------------------------
+    // GET
+    // --------------------------------------------------------
+
+    int httpCode =
+        http.GET();
+
+    // --------------------------------------------------------
+    // Successful HTTP response
+    // --------------------------------------------------------
+
+    if (httpCode > 0) {
+
+      response =
+          http.getString();
+
+      http.end();
+
+      client.stop();
+
+      // ------------------------------------------------------
+      // HTTP status
+      // ------------------------------------------------------
+
+      if (
+          httpCode !=
+          HTTP_CODE_OK
+      ) {
+
+        telegramStatus =
+            "HTTP error: " +
+            String(httpCode);
+
+        addLog(
+            "Telegram HTTP error: " +
+            String(httpCode)
+        );
+
+        return false;
+      }
+
+      // ------------------------------------------------------
+      // Telegram API status
+      // ------------------------------------------------------
+
+      if (
+          response.indexOf(
+              "\"ok\":true"
+          ) < 0
+      ) {
+
+        telegramStatus =
+            "Telegram API error";
+
+        addLog(
+            "Telegram API returned error"
+        );
+
+        return false;
+      }
+
+      telegramStatus =
+          "Telegram request successful";
+
+      return true;
+    }
+
+    // --------------------------------------------------------
+    // Connection-level failure
+    //
+    // Example:
+    // -1
+    //
+    // Telegram did not return an HTTP response.
+    // --------------------------------------------------------
 
     addLog(
-        "Telegram HTTP begin failed"
+        "Telegram connection failed: " +
+        String(httpCode) +
+        " attempt " +
+        String(attempt) +
+        "/2"
     );
 
-    return false;
+    http.end();
+
+    client.stop();
+
+    // --------------------------------------------------------
+    // Retry once
+    // --------------------------------------------------------
+
+    if (attempt == 1) {
+
+      delay(250);
+    }
   }
 
-  http.setTimeout(5000);
+  telegramStatus =
+      "Telegram connection failed";
 
-  int httpCode =
-      http.GET();
-
-  response =
-      http.getString();
-
-  http.end();
-
-  if (
-      httpCode !=
-      HTTP_CODE_OK
-  ) {
-
-    telegramStatus =
-        "HTTP error: " +
-        String(httpCode);
-
-    addLog(
-        "Telegram HTTP error: " +
-        String(httpCode)
-    );
-
-    return false;
-  }
-
-  if (
-      response.indexOf(
-          "\"ok\":true"
-      ) < 0
-  ) {
-
-    telegramStatus =
-        "Telegram API error";
-
-    addLog(
-        "Telegram API returned error"
-    );
-
-    return false;
-  }
-
-  return true;
+  return false;
 }
 
 // ============================================================
@@ -1048,16 +1159,32 @@ void readAllLevelSensorsFiltered(
       i++
   ) {
 
-    if (digitalRead(LEVEL1_PIN) == HIGH)
+    if (
+        digitalRead(
+            LEVEL1_PIN
+        ) == HIGH
+    )
       highCount[0]++;
 
-    if (digitalRead(LEVEL2_PIN) == HIGH)
+    if (
+        digitalRead(
+            LEVEL2_PIN
+        ) == HIGH
+    )
       highCount[1]++;
 
-    if (digitalRead(LEVEL3_PIN) == HIGH)
+    if (
+        digitalRead(
+            LEVEL3_PIN
+        ) == HIGH
+    )
       highCount[2]++;
 
-    if (digitalRead(LEVEL4_PIN) == HIGH)
+    if (
+        digitalRead(
+            LEVEL4_PIN
+        ) == HIGH
+    )
       highCount[3]++;
 
     delayMicroseconds(
@@ -1076,12 +1203,12 @@ void readAllLevelSensorsFiltered(
       i < 4;
       i++
   ) {
+
     states[i] =
-        highCount[i] >= SENSOR_WET_REQUIRED;
+        highCount[i] >=
+        SENSOR_WET_REQUIRED;
   }
 }
-
-
 
 // ============================================================
 // CALCULATE LEVEL FROM CONFIRMED SENSOR STATES
@@ -1135,7 +1262,7 @@ String waterLevelText(
       return "LEVEL 3";
 
     case 4:
-      return "LEVEL 4";
+      return "FULL";
 
     case 5:
       return "FULL";
@@ -1162,7 +1289,8 @@ void handleWaterPresenceChange(
     );
 
     sendTelegram(
-        "💧 WATER DETECTED"
+        "💧Manjeera WATER DETECTED  ",
+        true
     );
 
   } else {
@@ -1172,7 +1300,8 @@ void handleWaterPresenceChange(
     );
 
     sendTelegram(
-        "🔵 WATER CLEARED"
+        "🔵Manjeera WATER CLEARED",
+        true
     );
   }
 }
@@ -1207,7 +1336,7 @@ void handleWaterLevelChange(
   } else {
 
     message =
-        "💧 WATER LEVEL: " +
+        "💧Tank WATER LEVEL: " +
         String(newLevel) +
         "/4";
   }
@@ -1526,7 +1655,6 @@ String buildTelegramStatus() {
               : "Unavailable"
       ) +
       "\n";
-
 
   // ----------------------------------------------------------
   // DuckDNS
@@ -2208,12 +2336,120 @@ http://)rawliteral";
         "WATER DETECTED"
         "</span>";
 
+    // ----------------------------------------------------------
+    // Presence
+    // ----------------------------------------------------------
+    html += "\n";
+    html +=
+        "Manjeera (P25,P26):";
+    html +=
+        waterPresence
+            ? "💧 WATER DETECTED"
+            : "🔵 DRY";
+
+    html += "\n";
+
+    // ----------------------------------------------------------
+    // Overall level
+    // ----------------------------------------------------------
+
+    html +=
+        "Water Level: " +
+        waterLevelText(
+            currentWaterLevel
+        ) +
+        " (" +
+        String(currentWaterLevel) +
+        "/4)\n\n";
+
+    // ----------------------------------------------------------
+    // Individual sensors
+    // ----------------------------------------------------------
+
+    html +=
+        "LEVEL SENSORS (27, 32, 33, 16, 17) \n";
+
+    for (
+        int i = 0;
+        i < 4;
+        i++
+    ) {
+
+        html +=
+            "L" +
+            String(i + 1) +
+            ": ";
+
+        html +=
+            confirmedLevelSensors[i]
+                ? "WET"
+                : "DRY ";
+
+        html += "\n";
+    }
+
+    html += "\n";
+
   } else {
 
     html +=
         "<span class=\"blue\">"
         "DRY"
         "</span>";
+            // ----------------------------------------------------------
+    // Presence
+    // ----------------------------------------------------------
+
+    html +=
+        "Manjeera (P25,P26): ";
+
+    html +=
+        waterPresence
+            ? "💧 WATER DETECTED"
+            : "🔵 DRY";
+
+    html += "\n";
+
+    // ----------------------------------------------------------
+    // Overall level
+    // ----------------------------------------------------------
+
+    html +=
+        "Water Level: " +
+        waterLevelText(
+            currentWaterLevel
+        ) +
+        " (" +
+        String(currentWaterLevel) +
+        "/4)\n\n";
+
+    // ----------------------------------------------------------
+    // Individual sensors
+    // ----------------------------------------------------------
+
+    html +=
+        "LEVEL SENSORS (27, 32, 33, 16, 17)\n";
+
+    for (
+        int i = 0;
+        i < 4;
+        i++
+    ) {
+
+        html +=
+            "L" +
+            String(i + 1) +
+            ": ";
+
+        html +=
+            confirmedLevelSensors[i]
+                ? "WET"
+                : "DRY";
+
+        html += "\n";
+    }
+
+    html += "\n";
   }
 
   html +=
