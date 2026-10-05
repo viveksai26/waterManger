@@ -12,7 +12,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.4"
+#define FIRMWARE_VERSION "4.5"
 
 // ============================================================
 // mDNS
@@ -926,6 +926,20 @@ bool sendTelegramMessage(
     return false;
   }
 
+  // Every message ends with a tappable /status command
+  String fullMessage =
+      message;
+
+  if (
+      !fullMessage.endsWith(
+          "/status"
+      )
+  ) {
+
+    fullMessage +=
+        "\n\n/status";
+  }
+
   String url =
       "https://api.telegram.org/bot" +
       String(TELEGRAM_BOT_TOKEN) +
@@ -936,7 +950,7 @@ bool sendTelegramMessage(
       ) +
       "&text=" +
       urlEncode(
-          message
+          fullMessage
       );
 
   if (
@@ -2284,6 +2298,8 @@ String htmlHeader(
 <html>
 <head>
 
+<meta charset="UTF-8">
+
 <meta name="viewport"
       content="width=device-width,initial-scale=1">
 
@@ -2454,124 +2470,22 @@ http://)rawliteral";
 
     html +=
         "<span class=\"danger\">"
-        "WATER DETECTED"
+        "💧 WATER DETECTED"
         "</span>";
-
-    // ----------------------------------------------------------
-    // Presence
-    // ----------------------------------------------------------
-    html += "\n";
-    html +=
-        "Manjeera (P25,P26):";
-    html +=
-        waterPresence
-            ? "💧 WATER DETECTED"
-            : "🔵 DRY";
-
-    html += "\n";
-
-    // ----------------------------------------------------------
-    // Overall level
-    // ----------------------------------------------------------
-
-    html +=
-        "Water Level: " +
-        waterLevelText(
-            currentWaterLevel
-        ) +
-        " (" +
-        String(currentWaterLevel) +
-        "/4)\n\n";
-
-    // ----------------------------------------------------------
-    // Individual sensors
-    // ----------------------------------------------------------
-
-    html +=
-        "LEVEL SENSORS (27, 32, 33, 16, 17) \n";
-
-    for (
-        int i = 0;
-        i < 4;
-        i++
-    ) {
-
-        html +=
-            "L" +
-            String(i + 1) +
-            ": ";
-
-        html +=
-            confirmedLevelSensors[i]
-                ? "WET"
-                : "DRY ";
-
-        html += "\n";
-    }
-
-    html += "\n";
 
   } else {
 
     html +=
         "<span class=\"blue\">"
-        "DRY"
+        "🔵 DRY"
         "</span>";
-            // ----------------------------------------------------------
-    // Presence
-    // ----------------------------------------------------------
-
-    html +=
-        "Manjeera (P25,P26): ";
-
-    html +=
-        waterPresence
-            ? "💧 WATER DETECTED"
-            : "🔵 DRY";
-
-    html += "\n";
-
-    // ----------------------------------------------------------
-    // Overall level
-    // ----------------------------------------------------------
-
-    html +=
-        "Water Level: " +
-        waterLevelText(
-            currentWaterLevel
-        ) +
-        " (" +
-        String(currentWaterLevel) +
-        "/4)\n\n";
-
-    // ----------------------------------------------------------
-    // Individual sensors
-    // ----------------------------------------------------------
-
-    html +=
-        "LEVEL SENSORS (27, 32, 33, 16, 17)\n";
-
-    for (
-        int i = 0;
-        i < 4;
-        i++
-    ) {
-
-        html +=
-            "L" +
-            String(i + 1) +
-            ": ";
-
-        html +=
-            confirmedLevelSensors[i]
-                ? "WET"
-                : "DRY";
-
-        html += "\n";
-    }
-
-    html += "\n";
   }
+
+  html +=
+      "<p style=\"font-size:14px;"
+      "font-weight:normal;color:#666;\">"
+      "Manjeera sensor (P25, P26)"
+      "</p>";
 
   html +=
       R"rawliteral(
