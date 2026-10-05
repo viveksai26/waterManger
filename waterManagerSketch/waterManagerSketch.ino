@@ -1586,7 +1586,7 @@ String buildTelegramStatus() {
   // ----------------------------------------------------------
 
   message +=
-      "LEVEL SENSORS (COMMON_PIN - 27, L1-32, L2-33, L3-16, L4-17 )\n"
+      "LEVEL SENSORS (COMMON_PIN - 27, L1-32, L2-33, L3-16, L4-17 )\n";
 
   for (
       int i = 0;
