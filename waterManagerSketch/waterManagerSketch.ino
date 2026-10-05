@@ -12,7 +12,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.3"
+#define FIRMWARE_VERSION "4.4"
 
 // ============================================================
 // mDNS
@@ -1778,6 +1778,84 @@ String extractJsonNumber(
 }
 
 // ============================================================
+// TELEGRAM JSON OBJECT SKIP
+//
+// Starting at a key, find its "{...}" value and return the
+// index just after the matching '}'. Returns -1 on failure.
+// ============================================================
+
+int skipJsonObject(
+    const String &json,
+    int startAt
+) {
+
+  int braceStart =
+      json.indexOf(
+          '{',
+          startAt
+      );
+
+  if (
+      braceStart < 0
+  ) {
+
+    return -1;
+  }
+
+  int depth =
+      0;
+
+  bool inString =
+      false;
+
+  bool escaped =
+      false;
+
+  for (
+      int i =
+          braceStart;
+      i < (int)json.length();
+      i++
+  ) {
+
+    char c =
+        json.charAt(i);
+
+    if (
+        inString
+    ) {
+
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+
+      continue;
+    }
+
+    if (c == '"') {
+      inString = true;
+    } else if (c == '{') {
+      depth++;
+    } else if (c == '}') {
+      depth--;
+
+      if (
+          depth == 0
+      ) {
+
+        return i + 1;
+      }
+    }
+  }
+
+  return -1;
+}
+
+// ============================================================
 // TELEGRAM JSON STRING EXTRACTION
 // ============================================================
 
@@ -2051,13 +2129,56 @@ void pollTelegram() {
 
     // --------------------------------------------------------
     // Extract message text
+    //
+    // When the user replies to a message, Telegram nests the
+    // original message in "reply_to_message" before our own
+    // "text". Skip that object so we read the reply's text.
     // --------------------------------------------------------
+
+    int textSearchFrom =
+        messagePosition;
+
+    int nextUpdatePosition =
+        response.indexOf(
+            "\"update_id\"",
+            updatePosition + 1
+        );
+
+    int replyPosition =
+        response.indexOf(
+            "\"reply_to_message\"",
+            messagePosition
+        );
+
+    if (
+        replyPosition >= 0 &&
+        (
+            nextUpdatePosition < 0 ||
+            replyPosition <
+                nextUpdatePosition
+        )
+    ) {
+
+      int replyEnd =
+          skipJsonObject(
+              response,
+              replyPosition
+          );
+
+      if (
+          replyEnd > 0
+      ) {
+
+        textSearchFrom =
+            replyEnd;
+      }
+    }
 
     String text =
         extractJsonString(
             response,
             "text",
-            messagePosition
+            textSearchFrom
         );
 
     // --------------------------------------------------------
