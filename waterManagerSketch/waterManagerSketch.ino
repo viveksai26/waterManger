@@ -5,6 +5,8 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
+#include <time.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
 
@@ -12,7 +14,51 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.6"
+#define FIRMWARE_VERSION "4.8"
+
+// ============================================================
+// CLOCK (NTP)
+//
+// POSIX timezone string. India Standard Time = UTC+5:30.
+// Can be overridden in config.h.
+// ============================================================
+
+#ifndef TIMEZONE
+#define TIMEZONE "IST-5:30"
+#endif
+
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.google.com"
+
+// ============================================================
+// DAILY SUMMARY
+//
+// Hour of the day (0-23, local time) to send the daily
+// Telegram summary. Can be overridden in config.h.
+// ============================================================
+
+#ifndef DAILY_SUMMARY_HOUR
+#define DAILY_SUMMARY_HOUR 8
+#endif
+
+// ============================================================
+// WATCHDOG
+//
+// Restart the ESP32 if the main loop stops running for this
+// long (for example a stuck network call).
+// ============================================================
+
+const uint32_t WATCHDOG_TIMEOUT_MS =
+    60000;
+
+// ============================================================
+// SUPPLY HISTORY
+// ============================================================
+
+#define HISTORY_SIZE 20
+
+// Number of entries shown by /history and on the dashboard
+#define HISTORY_SHOWN 10
 
 // ============================================================
 // mDNS
@@ -189,6 +235,181 @@ bool otaRunning =
 unsigned long bootTime =
     0;
 
+// Set by Telegram /restart; handled after the poll finishes
+bool restartRequested =
+    false;
+
+// ============================================================
+// SUPPLY HISTORY STATE
+//
+// One entry per Manjeera supply (water detected -> cleared).
+// Stored in flash so it survives restarts.
+//
+// start / end are Unix times (0 = unknown, clock not synced).
+// ============================================================
+
+struct SupplyEvent {
+  uint32_t start;
+  uint32_t end;
+  uint32_t durationSec;
+  uint8_t open;
+  uint8_t reserved[3];
+};
+
+struct SupplyHistory {
+  uint8_t count;
+  uint8_t reserved[3];
+  SupplyEvent events[HISTORY_SIZE];
+};
+
+// events[0] = oldest, events[count - 1] = newest
+SupplyHistory supplyHistory;
+
+// millis() when the current supply started (this boot only)
+unsigned long supplyStartMs =
+    0;
+
+bool supplyStartMsValid =
+    false;
+
+// ============================================================
+// TANK FILL HISTORY STATE
+//
+// One entry per fill: tank level rising from a lower level
+// all the way to FULL. Stored in flash.
+// ============================================================
+
+#define FILL_HISTORY_SIZE 10
+
+struct FillEvent {
+  uint32_t end;          // Unix time FULL reached (0 = unknown)
+  uint32_t durationSec;  // time from first rise to FULL
+  uint8_t fromLevel;     // level the fill started from (0-3)
+  uint8_t reserved[3];
+};
+
+struct FillHistory {
+  uint8_t count;
+  uint8_t reserved[3];
+  FillEvent events[FILL_HISTORY_SIZE];
+};
+
+// events[0] = oldest, events[count - 1] = newest
+FillHistory fillHistory;
+
+// Current fill in progress (this boot only)
+bool fillInProgress =
+    false;
+
+int fillFromLevel =
+    0;
+
+unsigned long fillStartMs =
+    0;
+
+// ============================================================
+// PENDING LEVEL ALERT
+//
+// Level changes that could not be sent (cooldown or network
+// failure) are retried instead of being dropped.
+// ============================================================
+
+bool levelAlertPending =
+    false;
+
+String pendingLevelAlert =
+    "";
+
+unsigned long lastLevelAlertAttempt =
+    0;
+
+// ============================================================
+// CLOCK HELPERS
+// ============================================================
+
+bool timeValid() {
+
+  // Any time after 2023 means NTP has synced
+  return time(nullptr) >
+         1700000000;
+}
+
+String formatTime(
+    time_t t,
+    const char *format
+) {
+
+  if (t == 0) {
+
+    return "unknown";
+  }
+
+  struct tm timeInfo;
+
+  localtime_r(
+      &t,
+      &timeInfo
+  );
+
+  char buffer[32];
+
+  strftime(
+      buffer,
+      sizeof(buffer),
+      format,
+      &timeInfo
+  );
+
+  return String(buffer);
+}
+
+String nowText() {
+
+  if (!timeValid()) {
+
+    return "not synced";
+  }
+
+  return formatTime(
+      time(nullptr),
+      "%d %b %Y %H:%M:%S"
+  );
+}
+
+String durationText(
+    uint32_t seconds
+) {
+
+  uint32_t minutes =
+      (seconds + 30) / 60;
+
+  if (minutes < 60) {
+
+    return String(minutes) +
+           " min";
+  }
+
+  return String(minutes / 60) +
+         "h " +
+         String(minutes % 60) +
+         "m";
+}
+
+// ============================================================
+// WATCHDOG HELPERS
+// ============================================================
+
+bool watchdogActive =
+    false;
+
+void feedWatchdog() {
+
+  if (watchdogActive) {
+
+    esp_task_wdt_reset();
+  }
+}
+
 // ============================================================
 // LOGGING
 // ============================================================
@@ -205,10 +426,19 @@ int logCount = 0;
 
 void addLog(String message) {
 
+  String stamp =
+      timeValid()
+          ? formatTime(
+                time(nullptr),
+                "%d %b %H:%M:%S"
+            )
+          : String(millis() / 1000) +
+                "s";
+
   String entry =
       "[" +
-      String(millis() / 1000) +
-      "s] " +
+      stamp +
+      "] " +
       message;
 
   if (logCount < MAX_LOGS) {
@@ -435,6 +665,8 @@ bool connectToWiFi() {
 
     delay(500);
 
+    feedWatchdog();
+
     Serial.print(".");
   }
 
@@ -563,6 +795,8 @@ void startSetupAP() {
 // ============================================================
 
 bool updateDuckDNS() {
+
+  feedWatchdog();
 
   if (!wifiConnected) {
 
@@ -733,6 +967,9 @@ bool telegramRequest(
       attempt <= 2;
       attempt++
   ) {
+
+    // Each attempt is bounded by its own timeouts
+    feedWatchdog();
 
     WiFiClientSecure client;
 
@@ -1016,14 +1253,17 @@ bool sendTelegram(
 bool sendTelegramStatusKeyboard() {
 
   String keyboard =
-      "{\"keyboard\":[[{\"text\":\"/status\"}]],"
+      "{\"keyboard\":[[{\"text\":\"/status\"},"
+      "{\"text\":\"/history\"}]],"
       "\"resize_keyboard\":true,"
       "\"one_time_keyboard\":false,"
       "\"is_persistent\":true}";
 
   return sendTelegramMessage(
       "📊 Water Monitor commands\n"
-      "Press /status to get the current status.",
+      "/status - current status\n"
+      "/history - recent Manjeera supply times\n"
+      "/restart - restart the ESP32",
       true,
       keyboard
   );
@@ -1038,7 +1278,11 @@ bool setupTelegramCommands() {
   String commands =
       "{\"commands\":["
       "{\"command\":\"status\","
-      "\"description\":\"Get current water status\"}"
+      "\"description\":\"Get current water status\"},"
+      "{\"command\":\"history\","
+      "\"description\":\"Recent Manjeera supply times\"},"
+      "{\"command\":\"restart\","
+      "\"description\":\"Restart the ESP32\"}"
       "]}";
 
   String url =
@@ -1067,7 +1311,7 @@ bool setupTelegramCommands() {
   }
 
   addLog(
-      "Telegram /status command registered"
+      "Telegram commands registered"
   );
 
   return true;
@@ -1286,6 +1530,519 @@ String waterLevelText(
 }
 
 // ============================================================
+// SUPPLY HISTORY STORAGE
+// ============================================================
+
+void loadSupplyHistory() {
+
+  memset(
+      &supplyHistory,
+      0,
+      sizeof(supplyHistory)
+  );
+
+  if (
+      preferences.getBytesLength(
+          "history"
+      ) !=
+      sizeof(supplyHistory)
+  ) {
+
+    addLog(
+        "Supply history: none stored"
+    );
+
+    return;
+  }
+
+  preferences.getBytes(
+      "history",
+      &supplyHistory,
+      sizeof(supplyHistory)
+  );
+
+  if (
+      supplyHistory.count >
+      HISTORY_SIZE
+  ) {
+
+    supplyHistory.count =
+        0;
+  }
+
+  addLog(
+      "Supply history loaded: " +
+      String(supplyHistory.count) +
+      " entries"
+  );
+}
+
+void saveSupplyHistory() {
+
+  preferences.putBytes(
+      "history",
+      &supplyHistory,
+      sizeof(supplyHistory)
+  );
+}
+
+SupplyEvent *latestSupply() {
+
+  if (
+      supplyHistory.count == 0
+  ) {
+
+    return nullptr;
+  }
+
+  return &supplyHistory.events[
+      supplyHistory.count - 1
+  ];
+}
+
+// ============================================================
+// SUPPLY HISTORY: START / END
+// ============================================================
+
+void startSupplyRecord() {
+
+  // Drop the oldest entry when full
+  if (
+      supplyHistory.count >=
+      HISTORY_SIZE
+  ) {
+
+    for (
+        int i = 0;
+        i < HISTORY_SIZE - 1;
+        i++
+    ) {
+
+      supplyHistory.events[i] =
+          supplyHistory.events[i + 1];
+    }
+
+    supplyHistory.count =
+        HISTORY_SIZE - 1;
+  }
+
+  SupplyEvent &event =
+      supplyHistory.events[
+          supplyHistory.count++
+      ];
+
+  memset(
+      &event,
+      0,
+      sizeof(event)
+  );
+
+  event.start =
+      timeValid()
+          ? (uint32_t)time(nullptr)
+          : 0;
+
+  event.open =
+      1;
+
+  supplyStartMs =
+      millis();
+
+  supplyStartMsValid =
+      true;
+
+  saveSupplyHistory();
+}
+
+// Returns the closed event, or nullptr if none was open
+SupplyEvent *endSupplyRecord() {
+
+  SupplyEvent *event =
+      latestSupply();
+
+  if (
+      event == nullptr ||
+      !event->open
+  ) {
+
+    return nullptr;
+  }
+
+  event->open =
+      0;
+
+  event->end =
+      timeValid()
+          ? (uint32_t)time(nullptr)
+          : 0;
+
+  if (
+      supplyStartMsValid
+  ) {
+
+    event->durationSec =
+        (millis() -
+         supplyStartMs) /
+        1000;
+
+  } else if (
+      event->start != 0 &&
+      event->end != 0
+  ) {
+
+    event->durationSec =
+        event->end -
+        event->start;
+  }
+
+  supplyStartMsValid =
+      false;
+
+  saveSupplyHistory();
+
+  return event;
+}
+
+// ------------------------------------------------------------
+// If the supply started before NTP synced, fill in the start
+// time once the clock becomes valid.
+// ------------------------------------------------------------
+
+void backfillSupplyStart() {
+
+  SupplyEvent *event =
+      latestSupply();
+
+  if (
+      event == nullptr ||
+      !event->open ||
+      event->start != 0 ||
+      !supplyStartMsValid ||
+      !timeValid()
+  ) {
+
+    return;
+  }
+
+  event->start =
+      (uint32_t)time(nullptr) -
+      (millis() -
+       supplyStartMs) /
+          1000;
+
+  saveSupplyHistory();
+}
+
+// ------------------------------------------------------------
+// On boot: reconcile an entry left open by a restart
+// ------------------------------------------------------------
+
+void reconcileSupplyOnBoot() {
+
+  SupplyEvent *event =
+      latestSupply();
+
+  bool openRecord =
+      event != nullptr &&
+      event->open;
+
+  if (
+      waterPresence &&
+      !openRecord
+  ) {
+
+    addLog(
+        "Water present at boot: starting supply record"
+    );
+
+    startSupplyRecord();
+
+  } else if (
+      !waterPresence &&
+      openRecord
+  ) {
+
+    // Supply ended while the ESP32 was off/restarting.
+    // End time is not known exactly.
+    event->open =
+        0;
+
+    event->end =
+        0;
+
+    event->durationSec =
+        0;
+
+    saveSupplyHistory();
+
+    addLog(
+        "Open supply record closed (ended during restart)"
+    );
+  }
+
+  // Water present and record open: keep it open.
+  // Duration is computed from start/end Unix times.
+}
+
+// ============================================================
+// TANK FILL HISTORY STORAGE
+// ============================================================
+
+void loadFillHistory() {
+
+  memset(
+      &fillHistory,
+      0,
+      sizeof(fillHistory)
+  );
+
+  if (
+      preferences.getBytesLength(
+          "fills"
+      ) !=
+      sizeof(fillHistory)
+  ) {
+
+    return;
+  }
+
+  preferences.getBytes(
+      "fills",
+      &fillHistory,
+      sizeof(fillHistory)
+  );
+
+  if (
+      fillHistory.count >
+      FILL_HISTORY_SIZE
+  ) {
+
+    fillHistory.count =
+        0;
+  }
+
+  addLog(
+      "Fill history loaded: " +
+      String(fillHistory.count) +
+      " entries"
+  );
+}
+
+FillEvent *recordFill(
+    int fromLevel,
+    uint32_t durationSec
+) {
+
+  // Drop the oldest entry when full
+  if (
+      fillHistory.count >=
+      FILL_HISTORY_SIZE
+  ) {
+
+    for (
+        int i = 0;
+        i < FILL_HISTORY_SIZE - 1;
+        i++
+    ) {
+
+      fillHistory.events[i] =
+          fillHistory.events[i + 1];
+    }
+
+    fillHistory.count =
+        FILL_HISTORY_SIZE - 1;
+  }
+
+  FillEvent &event =
+      fillHistory.events[
+          fillHistory.count++
+      ];
+
+  memset(
+      &event,
+      0,
+      sizeof(event)
+  );
+
+  event.end =
+      timeValid()
+          ? (uint32_t)time(nullptr)
+          : 0;
+
+  event.durationSec =
+      durationSec;
+
+  event.fromLevel =
+      fromLevel;
+
+  preferences.putBytes(
+      "fills",
+      &fillHistory,
+      sizeof(fillHistory)
+  );
+
+  return &event;
+}
+
+String fillLevelName(
+    int level
+) {
+
+  return level == 0
+             ? String("EMPTY")
+             : "L" + String(level);
+}
+
+String fillEventText(
+    const FillEvent &event
+) {
+
+  return formatTime(
+             event.end,
+             "%d %b %H:%M"
+         ) +
+         ": " +
+         fillLevelName(
+             event.fromLevel
+         ) +
+         " → FULL in " +
+         durationText(
+             event.durationSec
+         );
+}
+
+// ============================================================
+// SUPPLY HISTORY TEXT
+// ============================================================
+
+String supplyEventText(
+    const SupplyEvent &event
+) {
+
+  String text =
+      formatTime(
+          event.start,
+          "%d %b %H:%M"
+      );
+
+  if (event.open) {
+
+    text += " → now";
+
+    if (
+        event.start != 0 &&
+        timeValid()
+    ) {
+
+      text +=
+          " (" +
+          durationText(
+              (uint32_t)time(nullptr) -
+              event.start
+          ) +
+          ", ongoing)";
+
+    } else {
+
+      text += " (ongoing)";
+    }
+
+  } else if (
+      event.end == 0 &&
+      event.durationSec == 0
+  ) {
+
+    text +=
+        " → ? (ended during restart)";
+
+  } else {
+
+    text +=
+        " → " +
+        (
+            event.end != 0
+                ? formatTime(
+                      event.end,
+                      "%H:%M"
+                  )
+                : String("?")
+        ) +
+        " (" +
+        durationText(
+            event.durationSec
+        ) +
+        ")";
+  }
+
+  return text;
+}
+
+String buildHistoryMessage() {
+
+  String message =
+      "📜 MANJEERA SUPPLY HISTORY\n\n";
+
+  if (
+      supplyHistory.count == 0
+  ) {
+
+    message +=
+        "No supply recorded yet.\n";
+  }
+
+  // Newest first
+  int shown = 0;
+
+  for (
+      int i =
+          supplyHistory.count - 1;
+      i >= 0 &&
+      shown < HISTORY_SHOWN;
+      i--, shown++
+  ) {
+
+    message +=
+        "💧 " +
+        supplyEventText(
+            supplyHistory.events[i]
+        ) +
+        "\n";
+  }
+
+  // ----------------------------------------------------------
+  // Tank fills
+  // ----------------------------------------------------------
+
+  message +=
+      "\n🪣 TANK FILLS\n\n";
+
+  if (
+      fillHistory.count == 0
+  ) {
+
+    message +=
+        "No fill recorded yet.\n";
+  }
+
+  for (
+      int i =
+          fillHistory.count - 1;
+      i >= 0;
+      i--
+  ) {
+
+    message +=
+        "🔴 " +
+        fillEventText(
+            fillHistory.events[i]
+        ) +
+        "\n";
+  }
+
+  return message;
+}
+
+// ============================================================
 // WATER PRESENCE CHANGE
 // ============================================================
 
@@ -1302,8 +2059,23 @@ void handleWaterPresenceChange(
         "Water presence detected"
     );
 
+    startSupplyRecord();
+
+    String message =
+        "💧 Manjeera WATER DETECTED";
+
+    if (timeValid()) {
+
+      message +=
+          "\nStarted at " +
+          formatTime(
+              time(nullptr),
+              "%H:%M"
+          );
+    }
+
     sendTelegram(
-        "💧Manjeera WATER DETECTED  ",
+        message,
         true
     );
 
@@ -1313,8 +2085,33 @@ void handleWaterPresenceChange(
         "Water presence cleared"
     );
 
+    SupplyEvent *event =
+        endSupplyRecord();
+
+    String message =
+        "🔵 Manjeera WATER CLEARED";
+
+    if (event != nullptr) {
+
+      if (event->end != 0) {
+
+        message +=
+            "\nStopped at " +
+            formatTime(
+                event->end,
+                "%H:%M"
+            );
+      }
+
+      message +=
+          "\nDuration: " +
+          durationText(
+              event->durationSec
+          );
+    }
+
     sendTelegram(
-        "🔵Manjeera WATER CLEARED",
+        message,
         true
     );
   }
@@ -1328,8 +2125,89 @@ void handleWaterLevelChange(
     int newLevel
 ) {
 
+  int oldLevel =
+      currentWaterLevel;
+
   currentWaterLevel =
       newLevel;
+
+  addLog(
+      "Water level changed: " +
+      waterLevelText(
+          newLevel
+      )
+  );
+
+  // ----------------------------------------------------------
+  // Fill tracking
+  //
+  // A fill starts on the first rise and is recorded when the
+  // tank reaches FULL. Any drop cancels it.
+  // ----------------------------------------------------------
+
+  FillEvent *completedFill =
+      nullptr;
+
+  if (
+      newLevel > oldLevel
+  ) {
+
+    if (!fillInProgress) {
+
+      fillInProgress =
+          true;
+
+      fillFromLevel =
+          oldLevel;
+
+      fillStartMs =
+          millis();
+
+      addLog(
+          "Fill started from " +
+          fillLevelName(oldLevel)
+      );
+    }
+
+    if (
+        newLevel == 4
+    ) {
+
+      completedFill =
+          recordFill(
+              fillFromLevel,
+              (millis() -
+               fillStartMs) /
+                  1000
+          );
+
+      fillInProgress =
+          false;
+
+      addLog(
+          "Fill completed: " +
+          fillEventText(
+              *completedFill
+          )
+      );
+    }
+
+  } else if (
+      newLevel < oldLevel &&
+      fillInProgress
+  ) {
+
+    fillInProgress =
+        false;
+
+    addLog(
+        "Fill cancelled (level dropped)"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Alert message
+  // ----------------------------------------------------------
 
   String message;
 
@@ -1347,24 +2225,127 @@ void handleWaterLevelChange(
     message =
         "🔴 WATER LEVEL: FULL";
 
+    if (completedFill != nullptr) {
+
+      message +=
+          "\nFilled " +
+          fillLevelName(
+              completedFill->fromLevel
+          ) +
+          " → FULL in " +
+          durationText(
+              completedFill->durationSec
+          );
+    }
+
   } else {
 
     message =
-        "💧Tank WATER LEVEL: " +
+        "💧 Tank WATER LEVEL: " +
         String(newLevel) +
         "/4";
   }
 
-  addLog(
-      "Water level changed: " +
-      waterLevelText(
-          newLevel
-      )
-  );
+  // ----------------------------------------------------------
+  // FULL / EMPTY are important: send right away, ignoring
+  // the cooldown. Other levels respect the cooldown.
+  // Anything not sent is queued and retried, and a newer
+  // level replaces an older queued one.
+  // ----------------------------------------------------------
 
-  sendTelegram(
-      message
+  bool important =
+      newLevel == 0 ||
+      newLevel == 4;
+
+  if (
+      sendTelegram(
+          message,
+          important
+      )
+  ) {
+
+    levelAlertPending =
+        false;
+
+    return;
+  }
+
+  levelAlertPending =
+      true;
+
+  // Delayed alert: show when the change actually happened
+  if (timeValid()) {
+
+    message +=
+        "\n(at " +
+        formatTime(
+            time(nullptr),
+            "%H:%M"
+        ) +
+        ")";
+  }
+
+  pendingLevelAlert =
+      message;
+
+  lastLevelAlertAttempt =
+      millis();
+
+  addLog(
+      "Level alert queued for retry"
   );
+}
+
+// ------------------------------------------------------------
+// Retry a queued level alert once the cooldown has passed
+// ------------------------------------------------------------
+
+void flushPendingLevelAlert() {
+
+  if (
+      !levelAlertPending ||
+      !wifiConnected
+  ) {
+
+    return;
+  }
+
+  if (
+      millis() -
+          lastLevelAlertAttempt <
+      TELEGRAM_COOLDOWN
+  ) {
+
+    return;
+  }
+
+  if (
+      lastTelegramSent != 0 &&
+      millis() -
+              lastTelegramSent <
+          TELEGRAM_COOLDOWN
+  ) {
+
+    return;
+  }
+
+  lastLevelAlertAttempt =
+      millis();
+
+  if (
+      sendTelegram(
+          pendingLevelAlert,
+          true
+      )
+  ) {
+
+    levelAlertPending =
+        false;
+
+    addLog(
+        "Queued level alert sent"
+    );
+  }
 }
 
 // ============================================================
@@ -1579,7 +2560,22 @@ String buildTelegramStatus() {
           ? "💧 WATER DETECTED"
           : "🔵 DRY";
 
-  message += "\n\n";
+  message += "\n";
+
+  SupplyEvent *lastSupply =
+      latestSupply();
+
+  if (lastSupply != nullptr) {
+
+    message +=
+        "Last supply: " +
+        supplyEventText(
+            *lastSupply
+        ) +
+        "\n";
+  }
+
+  message += "\n";
 
   // ----------------------------------------------------------
   // Overall level
@@ -1651,6 +2647,8 @@ String buildTelegramStatus() {
           ")";
     }
 
+    message += "\n";
+
   } else {
 
     message +=
@@ -1695,7 +2693,246 @@ String buildTelegramStatus() {
       ) +
       "\n";
 
+  message +=
+      "Time: " +
+      nowText() +
+      "\n";
+
+  message +=
+      "Uptime: " +
+      getUptime() +
+      "\n";
+
   return message;
+}
+
+// ============================================================
+// DAILY SUMMARY
+// ============================================================
+
+String buildDailySummary() {
+
+  time_t now =
+      time(nullptr);
+
+  uint32_t windowStart =
+      (uint32_t)now -
+      86400UL;
+
+  String message =
+      "☀️ DAILY SUMMARY - " +
+      formatTime(
+          now,
+          "%d %b %Y"
+      ) +
+      "\n\n";
+
+  message +=
+      "Manjeera supply (last 24h):\n";
+
+  int supplies = 0;
+
+  uint32_t totalSec = 0;
+
+  for (
+      int i = 0;
+      i < supplyHistory.count;
+      i++
+  ) {
+
+    const SupplyEvent &event =
+        supplyHistory.events[i];
+
+    bool inWindow =
+        event.open ||
+        event.start >= windowStart ||
+        event.end >= windowStart;
+
+    if (!inWindow) {
+
+      continue;
+    }
+
+    supplies++;
+
+    totalSec +=
+        event.open &&
+                event.start != 0
+            ? (uint32_t)now -
+                  event.start
+            : event.durationSec;
+
+    message +=
+        "💧 " +
+        supplyEventText(event) +
+        "\n";
+  }
+
+  if (supplies == 0) {
+
+    message +=
+        "No supply in the last 24 hours.\n";
+
+  } else {
+
+    message +=
+        "Total: " +
+        String(supplies) +
+        (supplies == 1
+             ? " supply, "
+             : " supplies, ") +
+        durationText(totalSec) +
+        "\n";
+  }
+
+  // ----------------------------------------------------------
+  // Tank fills in the last 24h
+  // ----------------------------------------------------------
+
+  message +=
+      "\nTank fills (last 24h):\n";
+
+  int fills = 0;
+
+  for (
+      int i = 0;
+      i < fillHistory.count;
+      i++
+  ) {
+
+    const FillEvent &fill =
+        fillHistory.events[i];
+
+    if (
+        fill.end <
+        windowStart
+    ) {
+
+      continue;
+    }
+
+    fills++;
+
+    message +=
+        "🔴 " +
+        fillEventText(fill) +
+        "\n";
+  }
+
+  if (fills == 0) {
+
+    message +=
+        "No fill in the last 24 hours.\n";
+  }
+
+  message +=
+      "\nTank level: " +
+      waterLevelText(
+          currentWaterLevel
+      ) +
+      " (" +
+      String(currentWaterLevel) +
+      "/4)\n";
+
+  message +=
+      "Manjeera now: " +
+      String(
+          waterPresence
+              ? "💧 WATER DETECTED"
+              : "🔵 DRY"
+      ) +
+      "\n";
+
+  message +=
+      "Uptime: " +
+      getUptime() +
+      "\n";
+
+  return message;
+}
+
+// ------------------------------------------------------------
+// Send the summary once per day at DAILY_SUMMARY_HOUR.
+// The last sent day is stored so a restart does not resend.
+// ------------------------------------------------------------
+
+void checkDailySummary() {
+
+  static unsigned long lastCheck =
+      0;
+
+  if (
+      millis() -
+          lastCheck <
+      30000UL
+  ) {
+
+    return;
+  }
+
+  lastCheck =
+      millis();
+
+  backfillSupplyStart();
+
+  if (
+      !timeValid() ||
+      !wifiConnected
+  ) {
+
+    return;
+  }
+
+  time_t now =
+      time(nullptr);
+
+  struct tm timeInfo;
+
+  localtime_r(
+      &now,
+      &timeInfo
+  );
+
+  if (
+      timeInfo.tm_hour !=
+      DAILY_SUMMARY_HOUR
+  ) {
+
+    return;
+  }
+
+  // Unique per day, e.g. 2026 * 1000 + day of year
+  int32_t today =
+      (timeInfo.tm_year + 1900) *
+          1000 +
+      timeInfo.tm_yday;
+
+  if (
+      preferences.getInt(
+          "summaryDay",
+          0
+      ) == today
+  ) {
+
+    return;
+  }
+
+  if (
+      sendTelegram(
+          buildDailySummary(),
+          true
+      )
+  ) {
+
+    preferences.putInt(
+        "summaryDay",
+        today
+    );
+
+    addLog(
+        "Daily summary sent"
+    );
+  }
 }
 
 // ============================================================
@@ -2248,6 +3485,41 @@ void pollTelegram() {
     }
 
     // --------------------------------------------------------
+    // /history
+    // --------------------------------------------------------
+
+    else if (
+        text == "/history" ||
+        text.startsWith(
+            "/history@"
+        )
+    ) {
+
+      sendTelegram(
+          buildHistoryMessage(),
+          true
+      );
+    }
+
+    // --------------------------------------------------------
+    // /restart
+    //
+    // Restart happens after this poll, once the update has
+    // been acknowledged, so it is not processed again on boot.
+    // --------------------------------------------------------
+
+    else if (
+        text == "/restart" ||
+        text.startsWith(
+            "/restart@"
+        )
+    ) {
+
+      restartRequested =
+          true;
+    }
+
+    // --------------------------------------------------------
     // /start
     // --------------------------------------------------------
 
@@ -2277,6 +3549,65 @@ void pollTelegram() {
 
     telegramStatus =
         "Listening for /status";
+  }
+
+  // ----------------------------------------------------------
+  // Telegram /restart
+  // ----------------------------------------------------------
+
+  if (
+      restartRequested
+  ) {
+
+    restartRequested =
+        false;
+
+    // Acknowledge processed updates so /restart is not
+    // received again after reboot (restart loop).
+    String ackUrl =
+        "https://api.telegram.org/bot" +
+        String(TELEGRAM_BOT_TOKEN) +
+        "/getUpdates"
+        "?offset=" +
+        String(
+            telegramUpdateOffset
+        ) +
+        "&limit=1"
+        "&timeout=0";
+
+    String ackResponse;
+
+    if (
+        !telegramRequest(
+            ackUrl,
+            ackResponse
+        )
+    ) {
+
+      addLog(
+          "Restart cancelled: could not acknowledge Telegram update"
+      );
+
+      sendTelegram(
+          "⚠️ Restart cancelled: Telegram acknowledge failed. Try again.",
+          true
+      );
+
+      return;
+    }
+
+    addLog(
+        "Restart requested via Telegram"
+    );
+
+    sendTelegram(
+        "🔄 Restarting ESP32...",
+        true
+    );
+
+    delay(1000);
+
+    ESP.restart();
   }
 }
 
@@ -2700,6 +4031,18 @@ Test Telegram
 <h2>System</h2>
 
 <p>
+Time:
+<b>)rawliteral";
+
+  html +=
+      nowText();
+
+  html +=
+      R"rawliteral(
+</b>
+</p>
+
+<p>
 Uptime:
 <b>)rawliteral";
 
@@ -2753,6 +4096,83 @@ CPU:
 </b>
 </p>
 
+</div>
+
+<div class="card">
+
+<h2>Manjeera Supply History</h2>
+)rawliteral";
+
+  if (
+      supplyHistory.count == 0
+  ) {
+
+    html +=
+        "<p>No supply recorded yet.</p>";
+
+  } else {
+
+    html +=
+        "<ul style=\"padding-left:20px;line-height:1.7;\">";
+
+    int shown = 0;
+
+    for (
+        int i =
+            supplyHistory.count - 1;
+        i >= 0 &&
+        shown < HISTORY_SHOWN;
+        i--, shown++
+    ) {
+
+      html +=
+          "<li>" +
+          supplyEventText(
+              supplyHistory.events[i]
+          ) +
+          "</li>";
+    }
+
+    html +=
+        "</ul>";
+  }
+
+  html +=
+      "<h2>Tank Fills</h2>";
+
+  if (
+      fillHistory.count == 0
+  ) {
+
+    html +=
+        "<p>No fill recorded yet.</p>";
+
+  } else {
+
+    html +=
+        "<ul style=\"padding-left:20px;line-height:1.7;\">";
+
+    for (
+        int i =
+            fillHistory.count - 1;
+        i >= 0;
+        i--
+    ) {
+
+      html +=
+          "<li>" +
+          fillEventText(
+              fillHistory.events[i]
+          ) +
+          "</li>";
+    }
+
+    html +=
+        "</ul>";
+  }
+
+  html +=
+      R"rawliteral(
 </div>
 
 <div class="card">
@@ -3178,6 +4598,8 @@ void handleFirmwareUpload() {
       UPLOAD_FILE_WRITE
   ) {
 
+    feedWatchdog();
+
     if (
         Update.write(
             upload.buf,
@@ -3462,6 +4884,53 @@ void setup() {
   );
 
   // ----------------------------------------------------------
+  // WATCHDOG
+  //
+  // The core already starts the task watchdog; reconfigure it
+  // with a longer timeout and also watch the loop task.
+  // ----------------------------------------------------------
+
+  esp_task_wdt_config_t watchdogConfig = {
+      .timeout_ms = WATCHDOG_TIMEOUT_MS,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+  };
+
+  esp_task_wdt_reconfigure(
+      &watchdogConfig
+  );
+
+  if (
+      esp_task_wdt_add(NULL) ==
+      ESP_OK
+  ) {
+
+    watchdogActive =
+        true;
+
+    addLog(
+        "Watchdog enabled (" +
+        String(WATCHDOG_TIMEOUT_MS / 1000) +
+        "s)"
+    );
+  }
+
+  esp_reset_reason_t resetReason =
+      esp_reset_reason();
+
+  bool watchdogReset =
+      resetReason == ESP_RST_TASK_WDT ||
+      resetReason == ESP_RST_INT_WDT ||
+      resetReason == ESP_RST_WDT;
+
+  if (watchdogReset) {
+
+    addLog(
+        "Previous restart was caused by the watchdog"
+    );
+  }
+
+  // ----------------------------------------------------------
   // PREFERENCES
   // ----------------------------------------------------------
 
@@ -3469,6 +4938,10 @@ void setup() {
       "watermon",
       false
   );
+
+  loadSupplyHistory();
+
+  loadFillHistory();
 
   // ----------------------------------------------------------
   // SENSOR PINS
@@ -3536,6 +5009,40 @@ void setup() {
   } else {
 
     // --------------------------------------------------------
+    // CLOCK (NTP)
+    //
+    // Wait up to 5 seconds so the startup message and first
+    // logs have a real time. Sync continues in background.
+    // --------------------------------------------------------
+
+    configTzTime(
+        TIMEZONE,
+        NTP_SERVER_1,
+        NTP_SERVER_2
+    );
+
+    unsigned long ntpStart =
+        millis();
+
+    while (
+        !timeValid() &&
+        millis() - ntpStart <
+            5000
+    ) {
+
+      delay(100);
+    }
+
+    addLog(
+        timeValid()
+            ? "Clock synced: " +
+                  nowText()
+            : String(
+                  "Clock not synced yet, will retry in background"
+              )
+    );
+
+    // --------------------------------------------------------
     // DUCKDNS
     // --------------------------------------------------------
 
@@ -3558,7 +5065,15 @@ void setup() {
             FIRMWARE_VERSION
         ) +
         "\nIPv4: " +
-        currentIPv4;
+        currentIPv4 +
+        "\nTime: " +
+        nowText();
+
+    if (watchdogReset) {
+
+      startupMessage +=
+          "\n⚠️ Restarted by watchdog (system was stuck)";
+    }
       startupMessage += "\n Manjeera: (WATER_DRIVE_PIN - 25, WATER_SENSE_PIN - 26)\n";
       startupMessage += "\n LEVEL SENSORS (COMMON_PIN - 27, L1-32, L2-33, L3-16, L4-17 )\n";
 
@@ -3587,6 +5102,8 @@ void setup() {
 
   initializeSensors();
 
+  reconcileSupplyOnBoot();
+
   addLog(
       "System ready"
   );
@@ -3597,6 +5114,12 @@ void setup() {
 // ============================================================
 
 void loop() {
+
+  // ----------------------------------------------------------
+  // WATCHDOG
+  // ----------------------------------------------------------
+
+  feedWatchdog();
 
   // ----------------------------------------------------------
   // WEB SERVER
@@ -3615,6 +5138,18 @@ void loop() {
   // ----------------------------------------------------------
 
   pollTelegram();
+
+  // ----------------------------------------------------------
+  // DAILY SUMMARY
+  // ----------------------------------------------------------
+
+  checkDailySummary();
+
+  // ----------------------------------------------------------
+  // QUEUED LEVEL ALERTS
+  // ----------------------------------------------------------
+
+  flushPendingLevelAlert();
 
   // ----------------------------------------------------------
   // WIFI RECONNECT
