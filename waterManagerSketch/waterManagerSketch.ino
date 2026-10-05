@@ -12,7 +12,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.5"
+#define FIRMWARE_VERSION "4.6"
 
 // ============================================================
 // mDNS
@@ -1573,14 +1573,13 @@ String buildTelegramStatus() {
   // ----------------------------------------------------------
 
   message +=
-      "Manjeera: (WATER_DRIVE_PIN - 25, WATER_SENSE_PIN - 26)\n";
-
+      "Manjeera:";
   message +=
       waterPresence
           ? "💧 WATER DETECTED"
           : "🔵 DRY";
 
-  message += "\n";
+  message += "\n\n";
 
   // ----------------------------------------------------------
   // Overall level
@@ -1598,9 +1597,6 @@ String buildTelegramStatus() {
   // ----------------------------------------------------------
   // Individual sensors
   // ----------------------------------------------------------
-
-  message +=
-      "LEVEL SENSORS (COMMON_PIN - 27, L1-32, L2-33, L3-16, L4-17 )\n";
 
   for (
       int i = 0;
@@ -3563,6 +3559,9 @@ void setup() {
         ) +
         "\nIPv4: " +
         currentIPv4;
+      startupMessage += "\n Manjeera: (WATER_DRIVE_PIN - 25, WATER_SENSE_PIN - 26)\n";
+      startupMessage += "\n LEVEL SENSORS (COMMON_PIN - 27, L1-32, L2-33, L3-16, L4-17 )\n";
+
 
     sendTelegram(
         startupMessage,
