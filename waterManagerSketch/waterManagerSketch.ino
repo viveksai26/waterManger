@@ -1559,7 +1559,7 @@ String buildTelegramStatus() {
   // ----------------------------------------------------------
 
   message +=
-      "Manjeera (P25,P26): ";
+      "Manjeera: (WATER_DRIVE_PIN - 25, WATER_SENSE_PIN - 26)\n";
 
   message +=
       waterPresence
@@ -1586,7 +1586,7 @@ String buildTelegramStatus() {
   // ----------------------------------------------------------
 
   message +=
-      "LEVEL SENSORS (27, 32, 33, 16, 17)\n";
+      "LEVEL SENSORS (COMMON_PIN - 27, L1-32, L2-33, L3-16, L4-17 )\n"
 
   for (
       int i = 0;
