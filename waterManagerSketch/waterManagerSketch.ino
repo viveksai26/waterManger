@@ -15,7 +15,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "5.1"
+#define FIRMWARE_VERSION "5.2"
 
 // ============================================================
 // CLOCK (NTP)
@@ -320,6 +320,30 @@ unsigned long levelReachedMs =
 
 bool levelReachedAtBoot =
     true;
+
+// ============================================================
+// DRAIN TRACKING
+//
+// A drain is a run of consecutive level drops. Used for the
+// fast-drain alert (open tap, leak, overflow pipe).
+// ============================================================
+
+// Alert if the tank drops one level (25%) faster than this.
+// Can be overridden in config.h.
+#ifndef FAST_DRAIN_MINUTES
+#define FAST_DRAIN_MINUTES 20
+#endif
+
+// Whether the last level change was a drop
+bool lastChangeWasDrop =
+    false;
+
+// Level and time the current drain started dropping from
+int drainFromLevel =
+    0;
+
+unsigned long drainStartMs =
+    0;
 
 // ============================================================
 // PENDING LEVEL ALERT
@@ -2369,6 +2393,54 @@ void handleWaterLevelChange(
       )
   );
 
+  // How long the tank stayed at the old level
+  uint32_t stepSec =
+      (millis() -
+       levelReachedMs) /
+      1000;
+
+  bool stepTimedFromBoot =
+      levelReachedAtBoot;
+
+  bool dropped =
+      newLevel < oldLevel;
+
+  // ----------------------------------------------------------
+  // Drain tracking (for the fast-drain alert)
+  //
+  // The step time is only a true drain time when the previous
+  // change was also a drop: after a rise, the tank may have
+  // sat at that level before use started.
+  // ----------------------------------------------------------
+
+  bool fastDrain =
+      false;
+
+  if (dropped) {
+
+    if (!lastChangeWasDrop) {
+
+      drainFromLevel =
+          oldLevel;
+
+      drainStartMs =
+          millis();
+
+    } else if (
+        !stepTimedFromBoot &&
+        stepSec <
+            (uint32_t)FAST_DRAIN_MINUTES *
+                60
+    ) {
+
+      fastDrain =
+          true;
+    }
+  }
+
+  lastChangeWasDrop =
+      dropped;
+
   // ----------------------------------------------------------
   // Fill tracking
   //
@@ -2459,7 +2531,74 @@ void handleWaterLevelChange(
 
   String message;
 
-  if (
+  String atTime =
+      timeValid()
+          ? " at " +
+                formatTime(
+                    time(nullptr),
+                    "%H:%M"
+                )
+          : String("");
+
+  // e.g. "L4 → L3 took 2h 10m"
+  String stepText =
+      fillLevelName(oldLevel) +
+      " → " +
+      fillLevelName(newLevel) +
+      " took " +
+      durationText(stepSec) +
+      (stepTimedFromBoot
+           ? " (timed from boot)"
+           : "");
+
+  if (dropped) {
+
+    // --------------------------------------------------------
+    // Drops: time of the change and how long the tank stayed
+    // at the previous level
+    // --------------------------------------------------------
+
+    if (newLevel == 0) {
+
+      message =
+          "🔵 WATER LEVEL: EMPTY" +
+          atTime;
+
+    } else if (newLevel == 1) {
+
+      // Low water: refill soon
+      message =
+          timeValid()
+              ? "🔴 LOW WATER: Tank at 25% since " +
+                    formatTime(
+                        time(nullptr),
+                        "%H:%M"
+                    )
+              : String(
+                    "🔴 LOW WATER: Tank at 25%"
+                );
+
+    } else {
+
+      message =
+          "💧 Tank " +
+          String(oldLevel * 25) +
+          "% → " +
+          String(newLevel * 25) +
+          "%" +
+          atTime;
+    }
+
+    message +=
+        "\n" +
+        stepText;
+
+    addLog(
+        "Level drop: " +
+        stepText
+    );
+
+  } else if (
       newLevel == 0
   ) {
 
@@ -2501,15 +2640,52 @@ void handleWaterLevelChange(
   }
 
   // ----------------------------------------------------------
-  // FULL / EMPTY are important: send right away, ignoring
-  // the cooldown. Other levels respect the cooldown.
+  // Fast-drain alert: separate message through the general
+  // retry queue, so a later level alert cannot replace it.
+  // ----------------------------------------------------------
+
+  if (fastDrain) {
+
+    String drainMessage =
+        "⚠️ FAST DRAIN\n"
+        "Tank dropped " +
+        String(drainFromLevel * 25) +
+        "% → " +
+        String(newLevel * 25) +
+        "% in " +
+        durationText(
+            (millis() -
+             drainStartMs) /
+            1000
+        ) +
+        atTime +
+        "\nCheck for an open tap, a leak or the overflow pipe.";
+
+    addLog(
+        "Fast drain: " +
+        stepText
+    );
+
+    sendTelegram(
+        drainMessage,
+        true
+    );
+  }
+
+  // ----------------------------------------------------------
+  // FULL / EMPTY / LOW WATER are important: send right away,
+  // ignoring the cooldown. Other levels respect the cooldown.
   // Anything not sent is queued and retried, and a newer
   // level replaces an older queued one.
   // ----------------------------------------------------------
 
+  // After a fast-drain alert the level alert must not be held
+  // back by the cooldown either.
   bool important =
       newLevel == 0 ||
-      newLevel == 4;
+      newLevel == 4 ||
+      (dropped && newLevel == 1) ||
+      fastDrain;
 
   // Level alerts use their own queue (below), where a newer
   // level replaces an older one, so not the general queue.
@@ -2531,7 +2707,11 @@ void handleWaterLevelChange(
       true;
 
   // Delayed alert: show when the change actually happened
-  if (timeValid()) {
+  // (drop alerts already include the time)
+  if (
+      timeValid() &&
+      !dropped
+  ) {
 
     message +=
         "\n(at " +

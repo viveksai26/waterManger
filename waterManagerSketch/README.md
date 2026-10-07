@@ -119,6 +119,7 @@ Copy `config.example.h` to `config.h` in the sketch folder and fill in your valu
 // Optional overrides
 // #define TIMEZONE "IST-5:30"        // POSIX TZ string
 // #define DAILY_SUMMARY_HOUR 8       // 0-23, local time
+// #define FAST_DRAIN_MINUTES 20      // fast-drain alert threshold per level
 ```
 
 `config.h` is listed in `.gitignore`. **Never commit it**, because it contains your secrets.
@@ -185,8 +186,11 @@ Network, domain and system details are in the **startup message** instead of `/s
 | Boot | 🟢 started, with network, domain and system info, and sensor pins (plus ⚠️ if the restart was caused by the watchdog) |
 | Supply starts / stops | 💧 WATER DETECTED / 🔵 WATER CLEARED, with times and duration |
 | Tank FULL | 🔴 FULL, with fill time (`(timed from boot)` if the starting level was already there at boot) |
-| Tank EMPTY | 🔵 EMPTY |
-| Tank level 1–3 | 💧 Tank WATER LEVEL n/4 (delayed alerts show `(at HH:MM)`) |
+| Tank EMPTY | 🔵 EMPTY, with time and how long it stayed at L1 |
+| Tank drops a level | 💧 `Tank 100% → 75% at 14:32` + `L4 → L3 took 2h 10m` |
+| Tank drops to L1 (25%) | 🔴 `LOW WATER: Tank at 25% since 18:40` + time at L2. Sent immediately |
+| Tank drops fast | ⚠️ `FAST DRAIN — Tank dropped 100% → 50% in 12 min`, when a level drains in under 20 min (`FAST_DRAIN_MINUTES`). Checks for an open tap, leak or overflow |
+| Tank rises a level | 💧 Tank WATER LEVEL n/4 (delayed alerts show `(at HH:MM)`) |
 | Every day at 08:00 | ☀️ Daily summary |
 
 ### How history is recorded
@@ -224,6 +228,7 @@ Edit these in `waterManagerSketch.ino`. The ones marked * can also be set in `co
 | `MDNS_HOSTNAME` | `watermanager` | `http://<name>.local` |
 | `TIMEZONE`* | `IST-5:30` | POSIX timezone string |
 | `DAILY_SUMMARY_HOUR`* | `8` | Hour to send the daily summary |
+| `FAST_DRAIN_MINUTES`* | `20` | Fast-drain alert if one level (25%) drains faster than this |
 | `WATCHDOG_TIMEOUT_MS` | 60000 | Restart if the loop is stuck this long |
 | `HISTORY_SIZE` / `HISTORY_SHOWN` | 20 / 10 | Supplies stored / shown |
 | `FILL_HISTORY_SIZE` | 10 | Tank fills stored |
