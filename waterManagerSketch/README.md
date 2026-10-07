@@ -20,8 +20,10 @@ ESP32 firmware that monitors the **Manjeera water supply** and the **tank water 
   - FULL and EMPTY are sent immediately.
   - Levels 1–3 respect a 30 s cooldown. An alert that couldn't be sent is queued and retried rather than dropped.
   - The FULL alert includes the fill time, for example `Filled L1 → FULL in 52 min`.
+- **Startup message** with network (Wi-Fi, IPv4), DuckDNS domain and system info (firmware, time, uptime).
 - **Daily summary** at 08:00: supplies and tank fills from the last 24 h, the current tank level, and uptime.
-- **Commands:** `/status`, `/history`, `/restart`. Every message ends with a tappable `/status`.
+- **Commands:** `/status`, `/history`, `/restart`, also listed in Telegram's `/` menu. Every message ends with a tappable `/status`.
+- **Colour-coded `/status`:** the tank level as a percentage with a gauge, and each sensor with its percentage and WET/DRY state.
 - **Replies work.** Replying `/status` to an old message works the same as typing it.
 
 ### History (saved in flash, survives restarts)
@@ -29,12 +31,12 @@ ESP32 firmware that monitors the **Manjeera water supply** and the **tank water 
 - The last **10 tank fills**: start level, the time FULL was reached, and how long it took.
 
 ### Web dashboard
-- Supply status, tank level, each sensor, network, Telegram status, current time, uptime, supply history, tank fills and the event log.
+- Supply status, tank level, each sensor, network, Telegram status, current time, uptime, supply history, tank fills and the event log (last 150 entries).
 - The page refreshes itself every 10 seconds.
 - Wi-Fi settings, firmware upload (OTA) and restart, all behind HTTP basic auth.
 
 ### Reliability
-- **Clock sync (NTP)** in India Standard Time (IST) by default. Logs and alerts use real times.
+- **Clock sync (NTP)** in India Standard Time (IST) by default. Logs and alerts use real times, including logs written during boot.
 - **Watchdog.** If the main loop is stuck for 60 s, the ESP32 restarts. The next startup message says it was a watchdog restart.
 - **Wi-Fi auto-reconnect.** After reconnecting, it also re-registers mDNS, DuckDNS and the Telegram commands.
 - **Setup access point.** If no Wi-Fi is saved or the connection fails, the ESP32 starts its own Wi-Fi network for configuration.
@@ -149,20 +151,39 @@ Log in with `WEB_USERNAME` / `WEB_PASSWORD`.
 
 | Command | What it does |
 |---|---|
-| `/status` | Supply state, last supply, tank level, L1–L4, network, firmware, time, uptime |
+| `/status` | Tank level as a colour-coded percentage and gauge, plus each sensor L4→L1 (see below) |
 | `/history` | Last 10 Manjeera supplies plus recent tank fills |
 | `/restart` | Restarts the ESP32 |
 | `/start` | Shows the command keyboard |
 
 Commands also work as a **reply** to any message and as `/status@YourBot` in groups. Only the configured `TELEGRAM_CHAT_ID` is accepted, and messages from other chats are ignored.
 
+Example `/status` reply:
+```
+💧 WATER MONITOR STATUS
+
+Water Level: 🟡 50%
+🟦🟦⬜⬜
+
+L4 (100%): ⚪ DRY
+L3 (75%): ⚪ DRY
+L2 (50%): 🟢 WET
+L1 (25%): 🟢 WET
+```
+
+| Level | 0% | 25% | 50% | 75% | 100% |
+|---|---|---|---|---|---|
+| Colour | 🔴 | 🟠 | 🟡 | 🟢 | 🔵 |
+
+Network, domain and system details are in the **startup message** instead of `/status`. Use `/restart` if you need them again.
+
 ### Alerts you will get
 
 | Event | Message |
 |---|---|
-| Boot | 🟢 started, with firmware, IP and time (plus ⚠️ if the restart was caused by the watchdog) |
+| Boot | 🟢 started, with network, domain and system info, and sensor pins (plus ⚠️ if the restart was caused by the watchdog) |
 | Supply starts / stops | 💧 WATER DETECTED / 🔵 WATER CLEARED, with times and duration |
-| Tank FULL | 🔴 FULL, with fill time |
+| Tank FULL | 🔴 FULL, with fill time (`(timed from boot)` if the starting level was already there at boot) |
 | Tank EMPTY | 🔵 EMPTY |
 | Tank level 1–3 | 💧 Tank WATER LEVEL n/4 (delayed alerts show `(at HH:MM)`) |
 | Every day at 08:00 | ☀️ Daily summary |
@@ -171,7 +192,9 @@ Commands also work as a **reply** to any message and as `/status@YourBot` in gro
 - **A supply** starts when water is detected and ends when it clears.
   - If the ESP32 restarts while water is flowing, the same supply continues.
   - If water stopped while the ESP32 was off, that entry shows *"ended during restart"*.
-- **A fill** starts on the first rise in tank level and is recorded when the tank reaches FULL. A drop in level cancels the fill. A fill that is in progress during a restart is not recorded.
+- **A fill** begins when the tank level rises and is recorded when the tank reaches FULL. A drop in level cancels the fill. A fill that is in progress during a restart is not recorded.
+  - The fill is **timed from when the tank reached the level it rose from**. For example, if L3 was reached at 14:20 and FULL at 15:05, the fill took 45 min.
+  - If the tank was already at that level when the ESP32 booted, the fill is timed from the **boot time** and marked *"timed from boot"*.
 
 ---
 
@@ -209,6 +232,7 @@ Edit these in `waterManagerSketch.ino`. The ones marked * can also be set in `co
 | `TELEGRAM_COOLDOWN` | 30 s | Minimum gap between non-urgent alerts |
 | `TELEGRAM_POLL_INTERVAL` | 5 s | How often to check for commands |
 | `DUCKDNS_UPDATE_INTERVAL` | 10 min | DuckDNS refresh |
+| `MAX_LOGS` | 150 | Event log entries kept (dashboard) |
 
 ---
 
@@ -217,7 +241,10 @@ Edit these in `waterManagerSketch.ino`. The ones marked * can also be set in `co
 | Problem | Check |
 |---|---|
 | No Telegram messages | Bot token and chat ID in `config.h`; you sent the bot at least one message; **Telegram** card / event log on the dashboard; use **Telegram Test** |
+| `Telegram HTTP error: 400 ...` in the log | The text after the code is Telegram's reason (for example a wrong chat ID) |
+| `Telegram connection failed after 2 attempts` | Both tries failed, so that message or command check was lost. Occasional lines are fine; many in a row point to Wi-Fi or internet problems. A single failed try that succeeds on retry isn't logged |
 | Commands not answered | The chat ID must match exactly (a group ID is negative); check the log for "Telegram command received" |
+| Commands missing from the `/` menu | Restart the ESP32. The menu is registered at boot and after Wi-Fi reconnects; check the log for "Telegram commands registered" |
 | Time shows "not synced" | Internet access and NTP (UDP port 123) not blocked; sync retries in the background |
 | Sensor flickers WET/DRY | Clean the probes, check wiring and grounding, raise `SENSOR_WET_REQUIRED` or the debounce times |
 | Level stuck at a value | Make sure the common probe (GPIO 27) is at the very bottom; check each Lx wire on the dashboard |
