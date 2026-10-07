@@ -6,6 +6,7 @@
 #include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
 #include <time.h>
+#include <esp_sntp.h>
 #include <esp_task_wdt.h>
 
 #include "config.h"
@@ -14,7 +15,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.9"
+#define FIRMWARE_VERSION "5.0"
 
 // ============================================================
 // CLOCK (NTP)
@@ -307,6 +308,19 @@ int fillFromLevel =
 unsigned long fillStartMs =
     0;
 
+// Whether the current fill is timed from boot (level was
+// already there at boot, so the real start is unknown)
+bool fillTimedFromBoot =
+    false;
+
+// millis() when the tank reached its current level.
+// At boot this is the boot time.
+unsigned long levelReachedMs =
+    0;
+
+bool levelReachedAtBoot =
+    true;
+
 // ============================================================
 // PENDING LEVEL ALERT
 //
@@ -414,7 +428,7 @@ void feedWatchdog() {
 // LOGGING
 // ============================================================
 
-#define MAX_LOGS 50
+#define MAX_LOGS 150
 
 String logs[MAX_LOGS];
 
@@ -962,6 +976,10 @@ bool telegramRequest(
   // at the connection level before receiving an HTTP response.
   // ----------------------------------------------------------
 
+  // Last connection error code, logged only if both fail
+  int lastError =
+      0;
+
   for (
       int attempt = 1;
       attempt <= 2;
@@ -992,13 +1010,6 @@ bool telegramRequest(
 
       telegramStatus =
           "HTTPS connection failed";
-
-      addLog(
-          "Telegram HTTP begin failed "
-          "(attempt " +
-          String(attempt) +
-          "/2)"
-      );
 
       http.end();
 
@@ -1055,9 +1066,16 @@ bool telegramRequest(
             "HTTP error: " +
             String(httpCode);
 
+        // Include Telegram's reason, e.g. "Bad Request: ..."
         addLog(
             "Telegram HTTP error: " +
-            String(httpCode)
+            String(httpCode) +
+            " " +
+            extractJsonString(
+                response,
+                "description",
+                0
+            )
         );
 
         return false;
@@ -1096,15 +1114,11 @@ bool telegramRequest(
     // -1
     //
     // Telegram did not return an HTTP response.
+    // Only logged if the retry also fails (below).
     // --------------------------------------------------------
 
-    addLog(
-        "Telegram connection failed: " +
-        String(httpCode) +
-        " attempt " +
-        String(attempt) +
-        "/2"
-    );
+    lastError =
+        httpCode;
 
     http.end();
 
@@ -1122,6 +1136,11 @@ bool telegramRequest(
 
   telegramStatus =
       "Telegram connection failed";
+
+  addLog(
+      "Telegram connection failed after 2 attempts: " +
+      String(lastError)
+  );
 
   return false;
 }
@@ -1155,10 +1174,6 @@ bool sendTelegramMessage(
           lastTelegramSent <
           TELEGRAM_COOLDOWN
   ) {
-
-    addLog(
-        "Telegram skipped: cooldown"
-    );
 
     return false;
   }
@@ -1210,10 +1225,7 @@ bool sendTelegramMessage(
       )
   ) {
 
-    addLog(
-        "Telegram send failed"
-    );
-
+    // Failure already logged by telegramRequest()
     return false;
   }
 
@@ -1222,10 +1234,6 @@ bool sendTelegramMessage(
 
   telegramStatus =
       "Last message sent successfully";
-
-  addLog(
-      "Telegram message sent"
-  );
 
   return true;
 }
@@ -1275,15 +1283,16 @@ bool sendTelegramStatusKeyboard() {
 
 bool setupTelegramCommands() {
 
+  // setMyCommands expects a JSON array of BotCommand
   String commands =
-      "{\"commands\":["
+      "["
       "{\"command\":\"status\","
       "\"description\":\"Get current water status\"},"
       "{\"command\":\"history\","
       "\"description\":\"Recent Manjeera supply times\"},"
       "{\"command\":\"restart\","
       "\"description\":\"Restart the ESP32\"}"
-      "]}";
+      "]";
 
   String url =
       "https://api.telegram.org/bot" +
@@ -2143,6 +2152,10 @@ void handleWaterLevelChange(
   //
   // A fill starts on the first rise and is recorded when the
   // tank reaches FULL. Any drop cancels it.
+  //
+  // The fill is timed from when the tank reached the level it
+  // started rising from (or from boot, if it was already at
+  // that level when the ESP32 started).
   // ----------------------------------------------------------
 
   FillEvent *completedFill =
@@ -2161,11 +2174,17 @@ void handleWaterLevelChange(
           oldLevel;
 
       fillStartMs =
-          millis();
+          levelReachedMs;
+
+      fillTimedFromBoot =
+          levelReachedAtBoot;
 
       addLog(
           "Fill started from " +
-          fillLevelName(oldLevel)
+          fillLevelName(oldLevel) +
+          (fillTimedFromBoot
+               ? " (timed from boot)"
+               : "")
       );
     }
 
@@ -2205,6 +2224,13 @@ void handleWaterLevelChange(
     );
   }
 
+  // The tank reached this level now
+  levelReachedMs =
+      millis();
+
+  levelReachedAtBoot =
+      false;
+
   // ----------------------------------------------------------
   // Alert message
   // ----------------------------------------------------------
@@ -2236,6 +2262,12 @@ void handleWaterLevelChange(
           durationText(
               completedFill->durationSec
           );
+
+      if (fillTimedFromBoot) {
+
+        message +=
+            " (timed from boot)";
+      }
     }
 
   } else {
@@ -3282,10 +3314,7 @@ void pollTelegram() {
       )
   ) {
 
-    addLog(
-        "Telegram polling failed"
-    );
-
+    // Failure already logged by telegramRequest()
     return;
   }
 
@@ -4849,6 +4878,13 @@ void initializeSensors() {
   lastRawWaterLevel =
       currentWaterLevel;
 
+  // Initial level counts as reached at boot
+  levelReachedMs =
+      bootTime;
+
+  levelReachedAtBoot =
+      true;
+
   addLog(
       "Initial water presence: " +
       String(
@@ -4871,6 +4907,17 @@ void initializeSensors() {
 // ============================================================
 
 void setup() {
+
+  // Apply the timezone first. After a software restart the
+  // clock still holds the time, so early logs would otherwise
+  // be printed in UTC until NTP starts.
+  setenv(
+      "TZ",
+      TIMEZONE,
+      1
+  );
+
+  tzset();
 
   Serial.begin(
       115200
@@ -5024,8 +5071,10 @@ void setup() {
     // --------------------------------------------------------
     // CLOCK (NTP)
     //
-    // Wait up to 5 seconds so the startup message and first
-    // logs have a real time. Sync continues in background.
+    // Wait up to 5 seconds for an actual NTP sync, so the
+    // startup message has a correct time. After a software
+    // restart the clock may already hold a time; this still
+    // waits for a fresh sync. Sync continues in background.
     // --------------------------------------------------------
 
     configTzTime(
@@ -5038,7 +5087,8 @@ void setup() {
         millis();
 
     while (
-        !timeValid() &&
+        sntp_get_sync_status() !=
+            SNTP_SYNC_STATUS_COMPLETED &&
         millis() - ntpStart <
             5000
     ) {
@@ -5046,8 +5096,12 @@ void setup() {
       delay(100);
     }
 
+    bool ntpSynced =
+        sntp_get_sync_status() ==
+        SNTP_SYNC_STATUS_COMPLETED;
+
     addLog(
-        timeValid()
+        ntpSynced
             ? "Clock synced: " +
                   nowText()
             : String(
