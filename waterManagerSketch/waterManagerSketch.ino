@@ -14,7 +14,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "4.8"
+#define FIRMWARE_VERSION "4.9"
 
 // ============================================================
 // CLOCK (NTP)
@@ -2550,50 +2550,34 @@ String buildTelegramStatus() {
       "💧 WATER MONITOR STATUS\n\n";
 
   // ----------------------------------------------------------
-  // Presence
+  // Overall level (percentage: each level = 25%)
+  //
+  // 0% 🔴  25% 🟠  50% 🟡  75% 🟢  100% 🔵
   // ----------------------------------------------------------
 
-  message +=
-      "Manjeera:";
-  message +=
-      waterPresence
-          ? "💧 WATER DETECTED"
-          : "🔵 DRY";
+  const char *levelColours[5] = {
+      "🔴",
+      "🟠",
+      "🟡",
+      "🟢",
+      "🔵"
+  };
 
-  message += "\n";
-
-  SupplyEvent *lastSupply =
-      latestSupply();
-
-  if (lastSupply != nullptr) {
-
-    message +=
-        "Last supply: " +
-        supplyEventText(
-            *lastSupply
-        ) +
-        "\n";
-  }
-
-  message += "\n";
-
-  // ----------------------------------------------------------
-  // Overall level
-  // ----------------------------------------------------------
+  int level =
+      constrain(
+          currentWaterLevel,
+          0,
+          4
+      );
 
   message +=
       "Water Level: " +
-      waterLevelText(
-          currentWaterLevel
-      ) +
-      " (" +
-      String(currentWaterLevel) +
-      "/4)\n\n";
+      String(levelColours[level]) +
+      " " +
+      String(level * 25) +
+      "%\n";
 
-  // ----------------------------------------------------------
-  // Individual sensors
-  // ----------------------------------------------------------
-
+  // Tank gauge, e.g. 🟦🟦⬜⬜
   for (
       int i = 0;
       i < 4;
@@ -2601,19 +2585,48 @@ String buildTelegramStatus() {
   ) {
 
     message +=
+        i < level
+            ? "🟦"
+            : "⬜";
+  }
+
+  message += "\n\n";
+
+  // ----------------------------------------------------------
+  // Individual sensors, top of tank first
+  // ----------------------------------------------------------
+
+  for (
+      int i = 3;
+      i >= 0;
+      i--
+  ) {
+
+    message +=
         "L" +
         String(i + 1) +
-        ": ";
+        " (" +
+        String((i + 1) * 25) +
+        "%): ";
 
     message +=
         confirmedLevelSensors[i]
-            ? "WET"
-            : "DRY";
+            ? "🟢 WET"
+            : "⚪ DRY";
 
     message += "\n";
   }
 
-  message += "\n";
+  return message;
+}
+
+// ============================================================
+// TELEGRAM SYSTEM INFO (startup message)
+// ============================================================
+
+String buildSystemInfo() {
+
+  String message = "";
 
   // ----------------------------------------------------------
   // Wi-Fi
@@ -5059,15 +5072,8 @@ void setup() {
     // --------------------------------------------------------
 
     String startupMessage =
-        "🟢 ESP32 Water Monitor started\n"
-        "Firmware: " +
-        String(
-            FIRMWARE_VERSION
-        ) +
-        "\nIPv4: " +
-        currentIPv4 +
-        "\nTime: " +
-        nowText();
+        "🟢 ESP32 Water Monitor started\n\n" +
+        buildSystemInfo();
 
     if (watchdogReset) {
 
