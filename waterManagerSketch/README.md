@@ -24,6 +24,7 @@ ESP32 firmware that monitors the **Manjeera water supply** and the **tank water 
 - **Daily summary** at 08:00: supplies and tank fills from the last 24 h, the current tank level, and uptime.
 - **Commands:** `/status`, `/history`, `/restart`, also listed in Telegram's `/` menu. Every message ends with a tappable `/status`.
 - **Colour-coded `/status`:** the tank level as a percentage with a gauge, and each sensor with its percentage and WET/DRY state.
+- **No lost messages.** Each request is tried 3 times with a 1 s pause. Messages that still fail (`/status` replies, Manjeera alerts, the daily summary) are queued and retried every 30 s.
 - **Replies work.** Replying `/status` to an old message works the same as typing it.
 
 ### History (saved in flash, survives restarts)
@@ -242,7 +243,8 @@ Edit these in `waterManagerSketch.ino`. The ones marked * can also be set in `co
 |---|---|
 | No Telegram messages | Bot token and chat ID in `config.h`; you sent the bot at least one message; **Telegram** card / event log on the dashboard; use **Telegram Test** |
 | `Telegram HTTP error: 400 ...` in the log | The text after the code is Telegram's reason (for example a wrong chat ID) |
-| `Telegram connection failed after 2 attempts` | Both tries failed, so that message or command check was lost. Occasional lines are fine; many in a row point to Wi-Fi or internet problems. A single failed try that succeeds on retry isn't logged |
+| `Telegram command check (harmless, retried in 5s) failed after 3 attempts` | One command check failed; the next check 5 s later picks up any waiting command. Nothing is lost |
+| `Telegram send failed after 3 attempts` + `queued for retry` | The message is retried every 30 s, oldest first, and arrives marked `(delayed, from HH:MM)`. It's dropped only after 20 failed retries while Wi-Fi is up. Many of these in a row point to Wi-Fi or internet problems |
 | Commands not answered | The chat ID must match exactly (a group ID is negative); check the log for "Telegram command received" |
 | Commands missing from the `/` menu | Restart the ESP32. The menu is registered at boot and after Wi-Fi reconnects; check the log for "Telegram commands registered" |
 | Time shows "not synced" | Internet access and NTP (UDP port 123) not blocked; sync retries in the background |

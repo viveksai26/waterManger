@@ -15,7 +15,7 @@
 // VERSION
 // ============================================================
 
-#define FIRMWARE_VERSION "5.0"
+#define FIRMWARE_VERSION "5.1"
 
 // ============================================================
 // CLOCK (NTP)
@@ -956,9 +956,19 @@ bool updateDuckDNS() {
 // TELEGRAM GENERIC REQUEST
 // ============================================================
 
+// Attempts per request, with a pause between them
+const int TELEGRAM_ATTEMPTS =
+    3;
+
+const unsigned long TELEGRAM_RETRY_PAUSE =
+    1000UL;
+
+// purpose: shown in the log on failure, e.g. "send",
+// "command check" (harmless, retried by the next poll)
 bool telegramRequest(
     const String &url,
-    String &response
+    String &response,
+    const String &purpose = "request"
 ) {
 
   if (!wifiConnected) {
@@ -970,21 +980,29 @@ bool telegramRequest(
   }
 
   // ----------------------------------------------------------
-  // Try twice.
+  // Try up to TELEGRAM_ATTEMPTS times.
   //
   // A negative HTTPClient result means that the ESP32 failed
   // at the connection level before receiving an HTTP response.
   // ----------------------------------------------------------
 
-  // Last connection error code, logged only if both fail
+  // Last connection error code, logged only if all fail
   int lastError =
       0;
 
   for (
       int attempt = 1;
-      attempt <= 2;
+      attempt <= TELEGRAM_ATTEMPTS;
       attempt++
   ) {
+
+    // Pause before retrying
+    if (attempt > 1) {
+
+      delay(
+          TELEGRAM_RETRY_PAUSE
+      );
+    }
 
     // Each attempt is bounded by its own timeouts
     feedWatchdog();
@@ -1014,11 +1032,6 @@ bool telegramRequest(
       http.end();
 
       client.stop();
-
-      if (attempt == 1) {
-
-        delay(250);
-      }
 
       continue;
     }
@@ -1068,7 +1081,9 @@ bool telegramRequest(
 
         // Include Telegram's reason, e.g. "Bad Request: ..."
         addLog(
-            "Telegram HTTP error: " +
+            "Telegram " +
+            purpose +
+            " HTTP error: " +
             String(httpCode) +
             " " +
             extractJsonString(
@@ -1095,7 +1110,14 @@ bool telegramRequest(
             "Telegram API error";
 
         addLog(
-            "Telegram API returned error"
+            "Telegram " +
+            purpose +
+            " API error: " +
+            extractJsonString(
+                response,
+                "description",
+                0
+            )
         );
 
         return false;
@@ -1114,7 +1136,7 @@ bool telegramRequest(
     // -1
     //
     // Telegram did not return an HTTP response.
-    // Only logged if the retry also fails (below).
+    // Only logged if every attempt fails (below).
     // --------------------------------------------------------
 
     lastError =
@@ -1123,22 +1145,17 @@ bool telegramRequest(
     http.end();
 
     client.stop();
-
-    // --------------------------------------------------------
-    // Retry once
-    // --------------------------------------------------------
-
-    if (attempt == 1) {
-
-      delay(250);
-    }
   }
 
   telegramStatus =
       "Telegram connection failed";
 
   addLog(
-      "Telegram connection failed after 2 attempts: " +
+      "Telegram " +
+      purpose +
+      " failed after " +
+      String(TELEGRAM_ATTEMPTS) +
+      " attempts: " +
       String(lastError)
   );
 
@@ -1149,10 +1166,128 @@ bool telegramRequest(
 // TELEGRAM SEND MESSAGE
 // ============================================================
 
+// ============================================================
+// TELEGRAM SEND QUEUE
+//
+// Messages that fail to send (network error or Wi-Fi down)
+// are queued and retried every TELEGRAM_QUEUE_RETRY, oldest
+// first. A delayed message shows when it was first sent.
+// ============================================================
+
+#define TELEGRAM_QUEUE_SIZE 6
+
+const unsigned long TELEGRAM_QUEUE_RETRY =
+    30000UL;
+
+// Give up on a message after this many failed retries
+// (only counted while Wi-Fi is connected)
+const int TELEGRAM_QUEUE_MAX_RETRIES =
+    20;
+
+String telegramQueue[TELEGRAM_QUEUE_SIZE];
+
+int telegramQueueRetries[TELEGRAM_QUEUE_SIZE];
+
+int telegramQueueCount =
+    0;
+
+unsigned long lastTelegramQueueAttempt =
+    0;
+
+void queueTelegramMessage(
+    String message
+) {
+
+  if (timeValid()) {
+
+    message +=
+        "\n(delayed, from " +
+        formatTime(
+            time(nullptr),
+            "%H:%M"
+        ) +
+        ")";
+  }
+
+  // Drop the oldest when full
+  if (
+      telegramQueueCount >=
+      TELEGRAM_QUEUE_SIZE
+  ) {
+
+    for (
+        int i = 0;
+        i < TELEGRAM_QUEUE_SIZE - 1;
+        i++
+    ) {
+
+      telegramQueue[i] =
+          telegramQueue[i + 1];
+
+      telegramQueueRetries[i] =
+          telegramQueueRetries[i + 1];
+    }
+
+    telegramQueueCount =
+        TELEGRAM_QUEUE_SIZE - 1;
+
+    addLog(
+        "Telegram queue full: oldest message dropped"
+    );
+  }
+
+  telegramQueue[telegramQueueCount] =
+      message;
+
+  telegramQueueRetries[telegramQueueCount] =
+      0;
+
+  telegramQueueCount++;
+
+  // First retry after a full interval
+  lastTelegramQueueAttempt =
+      millis();
+
+  addLog(
+      "Telegram message queued for retry (" +
+      String(telegramQueueCount) +
+      " waiting)"
+  );
+}
+
+void popTelegramQueue() {
+
+  for (
+      int i = 0;
+      i < telegramQueueCount - 1;
+      i++
+  ) {
+
+    telegramQueue[i] =
+        telegramQueue[i + 1];
+
+    telegramQueueRetries[i] =
+        telegramQueueRetries[i + 1];
+  }
+
+  telegramQueueCount--;
+
+  telegramQueue[telegramQueueCount] =
+      "";
+}
+
+// ============================================================
+// TELEGRAM SEND MESSAGE
+//
+// queueOnFailure: queue the message for retry if it could not
+// be sent. Not used for cooldown skips.
+// ============================================================
+
 bool sendTelegramMessage(
     const String &message,
     bool ignoreCooldown,
-    const String &replyMarkup
+    const String &replyMarkup,
+    bool queueOnFailure
 ) {
 
   if (!wifiConnected) {
@@ -1160,9 +1295,12 @@ bool sendTelegramMessage(
     telegramStatus =
         "Wi-Fi disconnected";
 
-    addLog(
-        "Telegram skipped: Wi-Fi disconnected"
-    );
+    if (queueOnFailure) {
+
+      queueTelegramMessage(
+          message
+      );
+    }
 
     return false;
   }
@@ -1221,11 +1359,19 @@ bool sendTelegramMessage(
   if (
       !telegramRequest(
           url,
-          response
+          response,
+          "send"
       )
   ) {
 
     // Failure already logged by telegramRequest()
+    if (queueOnFailure) {
+
+      queueTelegramMessage(
+          message
+      );
+    }
+
     return false;
   }
 
@@ -1244,14 +1390,88 @@ bool sendTelegramMessage(
 
 bool sendTelegram(
     const String &message,
-    bool ignoreCooldown = false
+    bool ignoreCooldown = false,
+    bool queueOnFailure = true
 ) {
 
   return sendTelegramMessage(
       message,
       ignoreCooldown,
-      ""
+      "",
+      queueOnFailure
   );
+}
+
+// ============================================================
+// TELEGRAM QUEUE RETRY (called from loop)
+// ============================================================
+
+void flushTelegramQueue() {
+
+  if (
+      telegramQueueCount == 0 ||
+      !wifiConnected
+  ) {
+
+    return;
+  }
+
+  if (
+      millis() -
+          lastTelegramQueueAttempt <
+      TELEGRAM_QUEUE_RETRY
+  ) {
+
+    return;
+  }
+
+  lastTelegramQueueAttempt =
+      millis();
+
+  // Send as many as possible, oldest first; stop at the
+  // first failure and try again next interval.
+  while (
+      telegramQueueCount > 0
+  ) {
+
+    if (
+        sendTelegramMessage(
+            telegramQueue[0],
+            true,
+            "",
+            false
+        )
+    ) {
+
+      popTelegramQueue();
+
+      addLog(
+          "Queued Telegram message sent (" +
+          String(telegramQueueCount) +
+          " waiting)"
+      );
+
+      continue;
+    }
+
+    telegramQueueRetries[0]++;
+
+    if (
+        telegramQueueRetries[0] >=
+        TELEGRAM_QUEUE_MAX_RETRIES
+    ) {
+
+      popTelegramQueue();
+
+      addLog(
+          "Queued Telegram message dropped after " +
+          String(TELEGRAM_QUEUE_MAX_RETRIES) +
+          " retries"
+      );
+    }
+
+    break;
+  }
 }
 
 // ============================================================
@@ -1273,7 +1493,8 @@ bool sendTelegramStatusKeyboard() {
       "/history - recent Manjeera supply times\n"
       "/restart - restart the ESP32",
       true,
-      keyboard
+      keyboard,
+      false   // keyboard is not queued
   );
 }
 
@@ -1308,7 +1529,8 @@ bool setupTelegramCommands() {
   if (
       !telegramRequest(
           url,
-          response
+          response,
+          "command menu"
       )
   ) {
 
@@ -2289,10 +2511,13 @@ void handleWaterLevelChange(
       newLevel == 0 ||
       newLevel == 4;
 
+  // Level alerts use their own queue (below), where a newer
+  // level replaces an older one, so not the general queue.
   if (
       sendTelegram(
           message,
-          important
+          important,
+          false
       )
   ) {
 
@@ -2367,7 +2592,8 @@ void flushPendingLevelAlert() {
   if (
       sendTelegram(
           pendingLevelAlert,
-          true
+          true,
+          false
       )
   ) {
 
@@ -2962,22 +3188,24 @@ void checkDailySummary() {
     return;
   }
 
-  if (
+  // If sending fails, the summary goes to the retry queue,
+  // so mark today as done either way (no duplicates).
+  bool sent =
       sendTelegram(
           buildDailySummary(),
           true
-      )
-  ) {
+      );
 
-    preferences.putInt(
-        "summaryDay",
-        today
-    );
+  preferences.putInt(
+      "summaryDay",
+      today
+  );
 
-    addLog(
-        "Daily summary sent"
-    );
-  }
+  addLog(
+      sent
+          ? "Daily summary sent"
+          : "Daily summary queued for retry"
+  );
 }
 
 // ============================================================
@@ -3310,7 +3538,8 @@ void pollTelegram() {
   if (
       !telegramRequest(
           url,
-          response
+          response,
+          "command check (harmless, retried in 5s)"
       )
   ) {
 
@@ -3622,7 +3851,8 @@ void pollTelegram() {
     if (
         !telegramRequest(
             ackUrl,
-            ackResponse
+            ackResponse,
+            "restart acknowledge"
         )
     ) {
 
@@ -3642,9 +3872,11 @@ void pollTelegram() {
         "Restart requested via Telegram"
     );
 
+    // Not queued: the queue is lost on restart anyway
     sendTelegram(
         "🔄 Restarting ESP32...",
-        true
+        true,
+        false
     );
 
     delay(1000);
@@ -4491,7 +4723,8 @@ void handleTelegramTest() {
           String(
               FIRMWARE_VERSION
           ),
-          true
+          true,
+          false   // test shows the real result, no retry
       );
 
   if (success) {
@@ -5210,6 +5443,12 @@ void loop() {
   // ----------------------------------------------------------
 
   flushPendingLevelAlert();
+
+  // ----------------------------------------------------------
+  // QUEUED TELEGRAM MESSAGES
+  // ----------------------------------------------------------
+
+  flushTelegramQueue();
 
   // ----------------------------------------------------------
   // WIFI RECONNECT
